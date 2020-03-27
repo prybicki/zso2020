@@ -41,18 +41,8 @@ typedef struct {
 const char* str_e_type(Elf64_Half e_type);
 const char* str_e_machine(Elf64_Half e_machine);
 
-// TODO: use just void** and size_t* as out
-bool mmap_path(const char* path, int open_flags, mode_t open_mode, int mmap_prot, int mmap_flags, void** out_addr, size_t* out_size);
+bool mmap_path(const char* path, int open_flags, mode_t open_mode, int mmap_prot, int mmap_flags, void** out_addr, size_t* inout_size);
 bool elf_check_sanity(MappedELF* elf, Elf64_Half expected_type);
-
-bool elf_print_strings(MappedELF* elf)
-{
-	for (size_t i = 0; i < elf->strtab_size; ++i) {
-		putchar(elf->strtab[i] == 0 ? '\n' : elf->strtab[i]);
-	}
-	
-	return true;
-}
 
 int main(int argc, char** argv) 
 {
@@ -60,10 +50,13 @@ int main(int argc, char** argv)
 		fprintf(stderr, "usage: %s <ET_EXEC> <ET_REL> <target ET_EXEC>\n", argv[0]);
 		return 1;
 	}
-	MappedELF exec;
-	MappedELF rel;
+	MappedELF exec = {0};
+	MappedELF rel = {0};
+	MappedELF out = {0};
+
 	exec.path = argv[1];
 	rel.path = argv[2];
+	out.path = argv[3];
 
 	if (!mmap_path(exec.path, O_RDONLY, 0, PROT_READ, MAP_PRIVATE, &exec.addr, &exec.size)
 	||  !mmap_path(rel.path, O_RDONLY, 0, PROT_READ, MAP_PRIVATE, &rel.addr, &rel.size)) {
@@ -75,17 +68,28 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	elf_print_strings(&exec);
-	elf_print_strings(&rel);
+	out.size = exec.size + rel.size;
+	if (!mmap_path(out.path, 
+	               O_RDWR | O_CREAT | O_TRUNC, 
+	               S_IRUSR | S_IWUSR,
+	               PROT_READ | PROT_WRITE, 
+	               MAP_SHARED, 
+	               &out.addr, &out.size)) {
+		return 1;
+	}
+
+	for (size_t i = 0; i < out.size; ++i) {
+		*(((char*) out.addr) + i) = '*';
+	}
 
 	printf("Done\n");
 	return 0;
 }
 
-bool mmap_path(const char* path, int open_flags, mode_t open_mode, int mmap_prot, int mmap_flags, void** out_addr, size_t* out_size)
+bool mmap_path(const char* path, int open_flags, mode_t open_mode, int mmap_prot, int mmap_flags, void** out_addr, size_t* inout_size)
 {
 	assert(out_addr != NULL);
-	assert(out_size != NULL);
+	assert(inout_size != NULL);
 
 	bool status = false;
 	
@@ -95,14 +99,28 @@ bool mmap_path(const char* path, int open_flags, mode_t open_mode, int mmap_prot
 		goto clean_nothing;
 	}
 
-	struct stat statbuf;
-	if (-1 == fstat(fd, &statbuf)) {
-		fprintf(stderr, "%s: failed to get size: %s\n", path, strerror(errno));
-		goto clean_open;
+	if (*inout_size == 0) {
+		// get actual file size
+		struct stat statbuf;
+		if (-1 == fstat(fd, &statbuf)) {
+			fprintf(stderr, "%s: failed to get size: %s\n", path, strerror(errno));
+			goto clean_open;
+		}
+		*inout_size = statbuf.st_size;
 	}
-	*out_size = statbuf.st_size;
+	else {
+		// resize file
+		if ((off_t) -1 == lseek(fd, *inout_size - 1, SEEK_SET)) {
+			fprintf(stderr, "%s: failed to resize file (lseek): %s\n", path, strerror(errno));
+			goto clean_open;
+		}
+		if (write(fd, "", 1) <= 0) {
+			fprintf(stderr, "%s: failed to resize file (write): %s\n", path, strerror(errno));
+			goto clean_open;
+		}
+	}
 
-	void* mmap_addr = mmap(NULL, *out_size, mmap_prot, mmap_flags, fd, 0);
+	void* mmap_addr = mmap(NULL, *inout_size, mmap_prot, mmap_flags, fd, 0);
 	if (MAP_FAILED == mmap_addr) {
 		fprintf(stderr, "%s: failed to mmap: %s\n", path, strerror(errno));
 		goto clean_open;
