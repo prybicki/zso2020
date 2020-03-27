@@ -1,9 +1,12 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <assert.h>
+#include <stdlib.h>
 
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -43,6 +46,84 @@ const char* str_e_machine(Elf64_Half e_machine);
 
 bool mmap_path(const char* path, int open_flags, mode_t open_mode, int mmap_prot, int mmap_flags, void** out_addr, size_t* inout_size);
 bool elf_check_sanity(MappedELF* elf, Elf64_Half expected_type);
+const char* elf_section_name(MappedELF* elf, Elf64_Half idx)
+{
+	return elf->strtab + elf->sct[idx].sh_name;
+}
+
+typedef struct
+{
+	Elf64_Half sh_idx;
+	Elf64_Xword sh_flags;
+} SectionFlagsIdx;
+
+int elf_section_flags_cmp(const void* void_lhs, const void* void_rhs)
+{
+	const SectionFlagsIdx* lhs = void_lhs;
+	const SectionFlagsIdx* rhs = void_rhs;
+	return (lhs->sh_flags < rhs->sh_flags) ? -1 : lhs->sh_flags > rhs->sh_flags;
+}
+
+bool elf_link(MappedELF* out, MappedELF* exec, MappedELF* rel)
+{
+	// Count SHF_ALLOC sections
+	// readonly
+
+	// Group sections by sorting by (flags & (SHF_WRITE | SHF_EXECINSTR))
+	size_t alloc_sect_cnt = 0;
+	SectionFlagsIdx* alloc_sect = malloc(rel->sct_count * sizeof(*alloc_sect));
+	if (NULL == alloc_sect) {
+		fprintf(stderr, "out of memory\n");
+		return false;
+	}
+	for (size_t i = 0; i < rel->sct_count; ++i) {
+		if (rel->sct[i].sh_flags & SHF_ALLOC) {
+			alloc_sect[alloc_sect_cnt].sh_idx = i;
+			alloc_sect[alloc_sect_cnt].sh_flags = (SHF_WRITE | SHF_EXECINSTR) & rel->sct[i].sh_flags;
+			alloc_sect_cnt += 1;
+		}
+	}
+	qsort(alloc_sect, alloc_sect_cnt, sizeof(*alloc_sect), elf_section_flags_cmp);
+	
+	for (size_t i = 0; i < alloc_sect_cnt; ++i) {
+		printf("sect: %10s\t%ld\t%ld %ld %ld\n", elf_section_name(rel, alloc_sect[i].sh_idx),
+		alloc_sect[i].sh_flags,
+		alloc_sect[i].sh_flags & SHF_ALLOC,
+		alloc_sect[i].sh_flags & SHF_WRITE,
+		alloc_sect[i].sh_flags & SHF_EXECINSTR);
+	}
+
+	// Count new program headers
+	size_t new_phdr_cnt = (alloc_sect_cnt > 0);
+	for (size_t i = 1; i < alloc_sect_cnt; ++i) {
+		if (alloc_sect[i].sh_flags != alloc_sect[i-1].sh_flags) {
+			new_phdr_cnt += 1;
+		}
+	}
+	printf("new headers: %zu\n", new_phdr_cnt);
+
+	// write phdrs (old+new) to out file
+	// remember to update virtual addresses where to load
+	// write shdrs to out file
+	// write sections (old+new)
+	
+
+
+
+	// size_t next = 0;
+	// uint8_t* out_bytes = (uint8_t*) out->addr;
+
+	
+	// // Copy header
+	// memcpy(out_bytes + next, exec->hdr, exec->hdr->e_ehsize);
+	// next += exec->hdr->e_ehsize;
+	// out->hdr = (Elf64_Ehdr*) out_bytes;
+
+
+	// free(sections);
+
+	return true;
+}
 
 int main(int argc, char** argv) 
 {
@@ -78,11 +159,10 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	for (size_t i = 0; i < out.size; ++i) {
-		*(((char*) out.addr) + i) = '*';
+	if (!elf_link(&out, &exec, &rel)) {
+		return 1;
 	}
 
-	printf("Done\n");
 	return 0;
 }
 
