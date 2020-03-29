@@ -26,11 +26,11 @@ typedef struct {
 	
 	Elf64_Ehdr* hdr;
 
-	Elf64_Shdr* sct;
-	size_t sct_count;
+	Elf64_Shdr* shdr;
+	size_t shdr_count;
 
-	Elf64_Phdr* prg;
-	size_t prg_count;
+	Elf64_Phdr* phdr;
+	size_t phdr_count;
 
 	const char* strtab;
 	size_t strtab_size;
@@ -48,12 +48,12 @@ bool mmap_path(const char* path, int open_flags, mode_t open_mode, int mmap_prot
 bool elf_check_sanity(MappedELF* elf, Elf64_Half expected_type);
 const char* elf_section_name(MappedELF* elf, Elf64_Half idx)
 {
-	return elf->strtab + elf->sct[idx].sh_name;
+	return elf->strtab + elf->shdr[idx].sh_name;
 }
 
 typedef struct
 {
-	Elf64_Half sh_idx;
+	Elf64_Half orig_idx;
 	Elf64_Xword sh_flags;
 } SectionFlagsIdx;
 
@@ -64,6 +64,46 @@ int elf_section_flags_cmp(const void* void_lhs, const void* void_rhs)
 	return (lhs->sh_flags < rhs->sh_flags) ? -1 : lhs->sh_flags > rhs->sh_flags;
 }
 
+char* align_ptr_to(size_t alignment, char* value)
+{
+	return value + (alignment - ((uintptr_t) value % alignment));
+}
+
+Elf64_Addr align_vaddr_to(size_t alignment, Elf64_Addr value)
+{
+	return value + (alignment - (value % alignment));
+}
+
+size_t elf_get_program_alignment(MappedELF* elf, Elf64_Word type)
+{
+	for (size_t i = 0; i < elf->phdr_count; i++) {
+		if (elf->phdr[i].p_type == type) {
+			return elf->phdr[i].p_align;
+		}
+	}
+	return 1;
+}
+
+Elf64_Word elf_section_to_program_flags(Elf64_Xword sflags)
+{
+	Elf64_Word program = 0;
+	program |= PF_R;
+	program |= (sflags & SHF_WRITE) ? PF_W : 0;
+	program |= (sflags & SHF_EXECINSTR) ? PF_X : 0;
+	return program;
+}
+
+Elf64_Addr elf_get_free_vaddr(MappedELF* elf)
+{
+	Elf64_Addr vaddr = 0;
+	for (size_t i = 0; i < elf->phdr_count; i++) {
+		if (elf->phdr[i].p_type == PT_LOAD) {
+			vaddr = elf->phdr[i].p_vaddr > vaddr ? elf->phdr[i].p_vaddr : vaddr;
+		}
+	}
+	return align_vaddr_to(sysconf(_SC_PAGE_SIZE), vaddr);
+}
+
 bool elf_link(MappedELF* out, MappedELF* exec, MappedELF* rel)
 {
 	// Count SHF_ALLOC sections
@@ -71,56 +111,77 @@ bool elf_link(MappedELF* out, MappedELF* exec, MappedELF* rel)
 
 	// Group sections by sorting by (flags & (SHF_WRITE | SHF_EXECINSTR))
 	size_t alloc_sect_cnt = 0;
-	SectionFlagsIdx* alloc_sect = malloc(rel->sct_count * sizeof(*alloc_sect));
+	SectionFlagsIdx* alloc_sect = malloc(rel->shdr_count * sizeof(*alloc_sect));
 	if (NULL == alloc_sect) {
 		fprintf(stderr, "out of memory\n");
 		return false;
 	}
-	for (size_t i = 0; i < rel->sct_count; ++i) {
-		if (rel->sct[i].sh_flags & SHF_ALLOC) {
-			alloc_sect[alloc_sect_cnt].sh_idx = i;
-			alloc_sect[alloc_sect_cnt].sh_flags = (SHF_WRITE | SHF_EXECINSTR) & rel->sct[i].sh_flags;
+	for (size_t i = 0; i < rel->shdr_count; ++i) {
+		if (rel->shdr[i].sh_flags & SHF_ALLOC) {
+			alloc_sect[alloc_sect_cnt].orig_idx = i;
+			alloc_sect[alloc_sect_cnt].sh_flags = (SHF_WRITE | SHF_EXECINSTR) & rel->shdr[i].sh_flags;
 			alloc_sect_cnt += 1;
 		}
 	}
 	qsort(alloc_sect, alloc_sect_cnt, sizeof(*alloc_sect), elf_section_flags_cmp);
 	
-	for (size_t i = 0; i < alloc_sect_cnt; ++i) {
-		printf("sect: %10s\t%ld\t%ld %ld %ld\n", elf_section_name(rel, alloc_sect[i].sh_idx),
-		alloc_sect[i].sh_flags,
-		alloc_sect[i].sh_flags & SHF_ALLOC,
-		alloc_sect[i].sh_flags & SHF_WRITE,
-		alloc_sect[i].sh_flags & SHF_EXECINSTR);
-	}
-
-	// Count new program headers
+	// Get number of new program headers.
 	size_t new_phdr_cnt = (alloc_sect_cnt > 0);
 	for (size_t i = 1; i < alloc_sect_cnt; ++i) {
 		if (alloc_sect[i].sh_flags != alloc_sect[i-1].sh_flags) {
 			new_phdr_cnt += 1;
 		}
 	}
-	printf("new headers: %zu\n", new_phdr_cnt);
 
-	// write phdrs (old+new) to out file
-	// remember to update virtual addresses where to load
-	// write shdrs to out file
-	// write sections (old+new)
-	
+	char* write_addr = (char*) out->addr;
 
+	// Paste new elf header and program headers, make space for new program headers
+	size_t ehdr_phdr_size = sizeof(Elf64_Ehdr) + exec->hdr->e_phentsize * (exec->hdr->e_phnum + new_phdr_cnt);
+	memcpy(write_addr, exec->addr, ehdr_phdr_size);
+	write_addr = align_ptr_to(sysconf(_SC_PAGE_SIZE), write_addr + ehdr_phdr_size);
 
+	// Paste the old file after new program headers
+	memcpy(write_addr, exec->addr, exec->size);
+	write_addr = align_ptr_to(sysconf(_SC_PAGE_SIZE), write_addr + exec->size);
 
-	// size_t next = 0;
-	// uint8_t* out_bytes = (uint8_t*) out->addr;
+	// Check sanity & fill shdr, phdr
+	out->hdr = (Elf64_Ehdr*) out->addr;
+	out->phdr = (Elf64_Phdr*) ((char*) out->addr + out->hdr->e_phoff);
 
-	
-	// // Copy header
-	// memcpy(out_bytes + next, exec->hdr, exec->hdr->e_ehsize);
-	// next += exec->hdr->e_ehsize;
-	// out->hdr = (Elf64_Ehdr*) out_bytes;
+	// Paste all the allocatable sections at the end of the output file
+	Elf64_Xword prev_flags = SHF_MASKOS; // anything that's != alloc_sect[0].sh_flags
+	size_t next_phdr = exec->hdr->e_phnum;
 
+	for (size_t alloc_shdr_idx = 0; alloc_shdr_idx < alloc_sect_cnt; ++alloc_shdr_idx) {
+		// Copy next section
+		Elf64_Shdr* curr_sect = rel->shdr + alloc_sect[alloc_shdr_idx].orig_idx;
+		write_addr = align_ptr_to(curr_sect->sh_addralign, write_addr);
+		memcpy(write_addr, (char*) rel->addr + curr_sect->sh_offset, curr_sect->sh_size);
 
-	// free(sections);
+		// Part of next segment?
+		if (alloc_sect[alloc_shdr_idx].sh_flags != prev_flags) {
+			out->phdr[next_phdr].p_type = PT_LOAD;
+			out->phdr[next_phdr].p_offset = write_addr - (char*) out->addr;
+			out->phdr[next_phdr].p_filesz = 0;
+			out->phdr[next_phdr].p_memsz = 0;
+			out->phdr[next_phdr].p_flags = elf_section_to_program_flags(alloc_sect[alloc_shdr_idx].sh_flags);
+			out->phdr[next_phdr].p_align = elf_get_program_alignment(exec, PT_LOAD);
+			out->phdr[next_phdr].p_vaddr = elf_get_free_vaddr(exec);
+			out->phdr[next_phdr].p_paddr = out->phdr[next_phdr].p_vaddr;
+			
+			next_phdr += 1;
+		}
+		size_t curr_phdr = next_phdr - 1;
+
+		out->phdr[curr_phdr].p_filesz += curr_sect->sh_size;
+		out->phdr[curr_phdr].p_memsz  += curr_sect->sh_size;
+
+		prev_flags = alloc_sect[alloc_shdr_idx].sh_flags;
+	}
+
+	free(alloc_sect);
+
+	// TODO fix offsets and elf header
 
 	return true;
 }
@@ -149,7 +210,7 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	out.size = exec.size + rel.size;
+	out.size = 2 * (exec.size + rel.size);
 	if (!mmap_path(out.path, 
 	               O_RDWR | O_CREAT | O_TRUNC, 
 	               S_IRUSR | S_IWUSR,
@@ -263,37 +324,34 @@ bool elf_check_sanity(MappedELF* elf, Elf64_Half expected_type)
 	}
 
 	// Section header table
-	elf->sct = (Elf64_Shdr*) (elf_bytes + elf->hdr->e_shoff);
+	elf->shdr = (Elf64_Shdr*) (elf_bytes + elf->hdr->e_shoff);
 	if (elf->hdr->e_shoff < elf->hdr->e_ehsize) {
-		elf->sct = NULL;
-		// TODO: section header is needed always, because of syms, right?
-		if (expected_type == ET_REL) {
-			fprintf(stderr, "%s: no sections in ET_REL file\n", elf->path);
-			return false;
-		}
+		fprintf(stderr, "%s: no sections in ET_REL file\n", elf->path);
+		elf->shdr = NULL;
+		return false;
 	}
 
-	if (elf->sct != NULL && sizeof(Elf64_Shdr) != elf->hdr->e_shentsize) {
+	if (elf->shdr != NULL && sizeof(Elf64_Shdr) != elf->hdr->e_shentsize) {
 		fprintf(stderr, "%s: invalid section entry size (%zu != %zu)\n", elf->path, sizeof(Elf64_Shdr), (size_t) elf->hdr->e_shentsize);
 		return false;
 	}
 
-	elf->sct_count = elf->hdr->e_shnum;
-	if (elf->sct_count == SHN_UNDEF) {
-		elf->sct_count = elf->sct[0].sh_size;
+	elf->shdr_count = elf->hdr->e_shnum;
+	if (elf->shdr_count == SHN_UNDEF) {
+		elf->shdr_count = elf->shdr[0].sh_size;
 	}
 
 	// Program header table
-	elf->prg = (Elf64_Phdr*) (elf_bytes + elf->hdr->e_phoff);
+	elf->phdr = (Elf64_Phdr*) (elf_bytes + elf->hdr->e_phoff);
 	if (elf->hdr->e_phoff < elf->hdr->e_ehsize) {
-		elf->prg = NULL;
+		elf->phdr = NULL;
 		if (expected_type == ET_EXEC) {
 			fprintf(stderr, "%s: no segments in ET_EXEC file\n", elf->path);
 			return false;
 		}
 	}
 
-	if (elf->prg != NULL && sizeof(Elf64_Phdr) != elf->hdr->e_phentsize) {
+	if (elf->phdr != NULL && sizeof(Elf64_Phdr) != elf->hdr->e_phentsize) {
 		fprintf(stderr, "%s: invalid segment entry size (%zu != %zu)\n",
 		        elf->path, (size_t) elf->hdr->e_shentsize, sizeof(Elf64_Shdr));
 		return false;
@@ -305,24 +363,24 @@ bool elf_check_sanity(MappedELF* elf, Elf64_Half expected_type)
 	Elf64_Word str_idx = elf->hdr->e_shstrndx;
 	if (str_idx != SHN_UNDEF) {
 		if (elf->hdr->e_shstrndx == SHN_XINDEX) {
-			str_idx = elf->sct[0].sh_link;
+			str_idx = elf->shdr[0].sh_link;
 		}
 
-		elf->strtab = (const char*) elf_bytes + elf->sct[str_idx].sh_offset;
-		elf->strtab_size = elf->sct[str_idx].sh_size;
+		elf->strtab = (const char*) elf_bytes + elf->shdr[str_idx].sh_offset;
+		elf->strtab_size = elf->shdr[str_idx].sh_size;
 	}
 
 	// Symbol section
 	elf->sym = NULL;
 	for (Elf64_Section i = 0; i < elf->hdr->e_shnum; ++i) {
-		if (elf->sct[i].sh_type == SHT_SYMTAB) {
-			if (elf->sct[i].sh_entsize != sizeof(Elf64_Sym)) {
+		if (elf->shdr[i].sh_type == SHT_SYMTAB) {
+			if (elf->shdr[i].sh_entsize != sizeof(Elf64_Sym)) {
 				fprintf(stderr, "%s: invalid symtab entry size (%zu != %zu)\n",
-				        elf->path, (size_t) elf->sct[i].sh_entsize, sizeof(Elf64_Sym));
+				        elf->path, (size_t) elf->shdr[i].sh_entsize, sizeof(Elf64_Sym));
 				return false;
 			}
-			elf->sym = (Elf64_Sym*) elf_bytes + elf->sct[i].sh_offset;
-			elf->sym_count = elf->sct[i].sh_size / elf->sct[i].sh_entsize;
+			elf->sym = (Elf64_Sym*) elf_bytes + elf->shdr[i].sh_offset;
+			elf->sym_count = elf->shdr[i].sh_size / elf->shdr[i].sh_entsize;
 			break;
 		}
 	}
