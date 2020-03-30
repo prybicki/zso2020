@@ -64,12 +64,7 @@ int elf_section_flags_cmp(const void* void_lhs, const void* void_rhs)
 	return (lhs->sh_flags < rhs->sh_flags) ? -1 : lhs->sh_flags > rhs->sh_flags;
 }
 
-char* align_ptr_to(size_t alignment, char* value)
-{
-	return value + (alignment - ((uintptr_t) value % alignment));
-}
-
-Elf64_Addr align_vaddr_to(size_t alignment, Elf64_Addr value)
+uint64_t align_to(uint64_t alignment, uint64_t value)
 {
 	return value + (alignment - (value % alignment));
 }
@@ -101,15 +96,12 @@ Elf64_Addr elf_get_free_vaddr(MappedELF* elf)
 			vaddr = elf->phdr[i].p_vaddr > vaddr ? elf->phdr[i].p_vaddr : vaddr;
 		}
 	}
-	return align_vaddr_to(sysconf(_SC_PAGE_SIZE), vaddr);
+	return align_to(sysconf(_SC_PAGE_SIZE), vaddr);
 }
 
 bool elf_link(MappedELF* out, MappedELF* exec, MappedELF* rel)
 {
-	// Count SHF_ALLOC sections
-	// readonly
-
-	// Group sections by sorting by (flags & (SHF_WRITE | SHF_EXECINSTR))
+	// Group SHF_ALLOC sections in ET_REL: sort by (flags & (SHF_WRITE | SHF_EXECINSTR))
 	size_t alloc_sect_cnt = 0;
 	SectionFlagsIdx* alloc_sect = malloc(rel->shdr_count * sizeof(*alloc_sect));
 	if (NULL == alloc_sect) {
@@ -125,7 +117,7 @@ bool elf_link(MappedELF* out, MappedELF* exec, MappedELF* rel)
 	}
 	qsort(alloc_sect, alloc_sect_cnt, sizeof(*alloc_sect), elf_section_flags_cmp);
 	
-	// Get number of new program headers.
+	// Get number of new program headers
 	size_t new_phdr_cnt = (alloc_sect_cnt > 0);
 	for (size_t i = 1; i < alloc_sect_cnt; ++i) {
 		if (alloc_sect[i].sh_flags != alloc_sect[i-1].sh_flags) {
@@ -133,35 +125,70 @@ bool elf_link(MappedELF* out, MappedELF* exec, MappedELF* rel)
 		}
 	}
 
-	char* write_addr = (char*) out->addr;
+	char* out_addr = (char*) out->addr;
+	size_t out_offset = 0;
 
-	// Paste new elf header and program headers, make space for new program headers
-	size_t ehdr_phdr_size = sizeof(Elf64_Ehdr) + exec->hdr->e_phentsize * (exec->hdr->e_phnum + new_phdr_cnt);
-	memcpy(write_addr, exec->addr, ehdr_phdr_size);
-	write_addr = align_ptr_to(sysconf(_SC_PAGE_SIZE), write_addr + ehdr_phdr_size);
+	// Paste the new elf header and program headers, make space for new program headers
+	size_t old_ehdr_phdr_size = sizeof(Elf64_Ehdr) + exec->hdr->e_phentsize * exec->hdr->e_phnum;
+	size_t new_phdr_size = new_phdr_cnt * exec->hdr->e_phentsize;
+	size_t ehdr_phdr_size = old_ehdr_phdr_size + new_phdr_size;
+	memcpy(out_addr + out_offset, exec->addr, ehdr_phdr_size);
+	out_offset += ehdr_phdr_size;
 
-	// Paste the old file after new program headers
-	memcpy(write_addr, exec->addr, exec->size);
-	write_addr = align_ptr_to(sysconf(_SC_PAGE_SIZE), write_addr + exec->size);
+	// Paste the old file after the new program headers
+	out_offset = align_to(sysconf(_SC_PAGE_SIZE), out_offset);
+	size_t bytes_prepended = out_offset;
+	memcpy(out_addr + out_offset, exec->addr, exec->size);
+	out_offset += exec->size;
 
-	// Check sanity & fill shdr, phdr
+	// Fix ELF header
 	out->hdr = (Elf64_Ehdr*) out->addr;
-	out->phdr = (Elf64_Phdr*) ((char*) out->addr + out->hdr->e_phoff);
+	out->hdr->e_phnum += new_phdr_cnt;
+	out->hdr->e_shoff += bytes_prepended;
+	
+	// Fix section headers
+	out->shdr = (Elf64_Shdr*) (out_addr + out->hdr->e_shoff);
+	out->shdr_count = out->hdr->e_shnum;
+
+	for (size_t i = 0; i < out->shdr_count; ++i) {
+		out->shdr[i].sh_offset += bytes_prepended;
+	}
+
+	// Fix (old) program headers
+	out->phdr = (Elf64_Phdr*) (out_addr + out->hdr->e_phoff);
+	out->phdr_count = out->hdr->e_phnum;
+
+	printf("oto %zu\n", exec->phdr_count);
+	for (size_t i = 0; i < exec->phdr_count; ++i) {
+		if (out->phdr[i].p_type == PT_PHDR) {
+			out->phdr[i].p_filesz += new_phdr_size;
+			out->phdr[i].p_memsz += new_phdr_size;
+		}
+		else {
+			out->phdr[i].p_offset += bytes_prepended;
+		}
+	}
+
+	// Fill rest of the convenience pointers in struct MappedELF.
+	if (!elf_check_sanity(out, ET_EXEC)) {
+		fprintf(stderr, "%s: sanity check failed\n", out->path);
+	}
 
 	// Paste all the allocatable sections at the end of the output file
 	Elf64_Xword prev_flags = SHF_MASKOS; // anything that's != alloc_sect[0].sh_flags
 	size_t next_phdr = exec->hdr->e_phnum;
 
 	for (size_t alloc_shdr_idx = 0; alloc_shdr_idx < alloc_sect_cnt; ++alloc_shdr_idx) {
-		// Copy next section
+		// Copy current section
 		Elf64_Shdr* curr_sect = rel->shdr + alloc_sect[alloc_shdr_idx].orig_idx;
-		write_addr = align_ptr_to(curr_sect->sh_addralign, write_addr);
-		memcpy(write_addr, (char*) rel->addr + curr_sect->sh_offset, curr_sect->sh_size);
+		out_offset = align_to(curr_sect->sh_addralign, out_offset);
+		memcpy(out_addr + out_offset, (char*) rel->addr + curr_sect->sh_offset, curr_sect->sh_size);
+		out_offset += curr_sect->sh_size;
 
-		// Part of next segment?
+		// Part of the next new segment, always taken on the first loop pass.
 		if (alloc_sect[alloc_shdr_idx].sh_flags != prev_flags) {
 			out->phdr[next_phdr].p_type = PT_LOAD;
-			out->phdr[next_phdr].p_offset = write_addr - (char*) out->addr;
+			out->phdr[next_phdr].p_offset = out_offset;
 			out->phdr[next_phdr].p_filesz = 0;
 			out->phdr[next_phdr].p_memsz = 0;
 			out->phdr[next_phdr].p_flags = elf_section_to_program_flags(alloc_sect[alloc_shdr_idx].sh_flags);
@@ -171,8 +198,8 @@ bool elf_link(MappedELF* out, MappedELF* exec, MappedELF* rel)
 			
 			next_phdr += 1;
 		}
+		// Note: curr_phdr >= exec->hdr->e_phnum
 		size_t curr_phdr = next_phdr - 1;
-
 		out->phdr[curr_phdr].p_filesz += curr_sect->sh_size;
 		out->phdr[curr_phdr].p_memsz  += curr_sect->sh_size;
 
@@ -180,8 +207,6 @@ bool elf_link(MappedELF* out, MappedELF* exec, MappedELF* rel)
 	}
 
 	free(alloc_sect);
-
-	// TODO fix offsets and elf header
 
 	return true;
 }
@@ -336,12 +361,14 @@ bool elf_check_sanity(MappedELF* elf, Elf64_Half expected_type)
 		return false;
 	}
 
+	// TODO extract into function
 	elf->shdr_count = elf->hdr->e_shnum;
 	if (elf->shdr_count == SHN_UNDEF) {
 		elf->shdr_count = elf->shdr[0].sh_size;
 	}
 
 	// Program header table
+	elf->phdr_count = elf->hdr->e_phnum;
 	elf->phdr = (Elf64_Phdr*) (elf_bytes + elf->hdr->e_phoff);
 	if (elf->hdr->e_phoff < elf->hdr->e_ehsize) {
 		elf->phdr = NULL;
