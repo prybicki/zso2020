@@ -8,22 +8,17 @@
 #include <unistd.h>
 #include <elf.h>
 
-// TODO write file with the same permissions
-
 typedef struct {
 	const char* path;
 	void* addr;
 	size_t size;
 } MemFile;
 
-typedef struct
-{
+typedef struct{
 	Elf64_Half orig_idx;
 	Elf64_Xword acc_flags;
-	// TODO:
 	Elf64_Addr vaddr;
 	Elf64_Off file_off;
-
 } AllocSectionInfo;
 
 // File accessors with safety features
@@ -66,6 +61,7 @@ Elf64_Addr elf_get_free_vaddr(MemFile* elf, size_t alignment);
 // Util functions
 uint64_t align_to(uint64_t alignment, uint64_t value);
 AllocSectionInfo* alloc_find_idx(AllocSectionInfo* arr, size_t count, Elf64_Half orig_idx);
+bool copy_file_permissions(const char* dst_path, const char* src_path);
 
 // Main functions
 bool memfile_read(MemFile* file);
@@ -284,7 +280,10 @@ Elf64_Addr elf_get_free_vaddr(MemFile* elf, size_t alignment)
 
 uint64_t align_to(uint64_t alignment, uint64_t value)
 {
-	return (alignment <= 1) ? value : value + (alignment - (value % alignment));
+	if (alignment <= 1 || value % alignment == 0) {
+		return value;
+	}
+	return value + (alignment - (value % alignment));
 }
 
 AllocSectionInfo* alloc_find_idx(AllocSectionInfo* arr, size_t count, Elf64_Half orig_idx)
@@ -542,13 +541,11 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 	out_offset += exec->size;
 
 	// Fix ELF header
-	Elf64_Ehdr* out_hdr = elf_hdr(out);
-	out_hdr->e_shoff += bytes_prepended;
+	elf_hdr(out)->e_shoff += bytes_prepended;
 
 	// Fix section headers
 	for (size_t i = 0; i < elf_shdr_cnt(out); ++i) {
-		Elf64_Shdr* shdr = elf_shdr(out, i);
-		shdr->sh_offset += bytes_prepended;
+		elf_shdr(out, i)->sh_offset += bytes_prepended;
 	}	
 
 	bool phdr_seen = false;
@@ -590,7 +587,8 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 		// Detect section belonging to a next segment (with different access attributes).
 		// This is always taken on the first loop pass.
 		if (alloc[alloc_idx].acc_flags != prev_flags) {
-			out_hdr->e_phnum += 1;
+			// printf("New phdr\n");
+			elf_hdr(out)->e_phnum += 1;
 			curr_section_vaddr_offset = 0;
 			Elf64_Phdr* curr_phdr = elf_phdr(out, elf_phdr_cnt(out) - 1);
 			curr_phdr->p_type = PT_LOAD;
@@ -601,6 +599,7 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 			curr_phdr->p_align = elf_get_program_alignment(exec, PT_LOAD);
 			curr_phdr->p_vaddr = curr_phdr->p_paddr = curr_phdr->p_offset + elf_get_free_vaddr(out, curr_phdr->p_align);
 		}
+		// printf("%s: 0x%zx\n", elf_shstrtab_str(rel, elf_shdr(rel, alloc[alloc_idx].orig_idx)->sh_name), out_offset);
 		Elf64_Phdr* curr_phdr = elf_phdr(out, elf_phdr_cnt(out) - 1);
 		// Update current segment's size
 		curr_phdr->p_filesz += shdr->sh_size;
@@ -636,44 +635,45 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 
 			Elf64_Addr sym_vaddr = 0;
 			const char* sym_name = elf_sym_name(rel, reloc_symtab, sym_idx);
-			Elf64_Section sym_sect_idx = elf_sym(rel, reloc_symtab, sym_idx)->st_shndx;
-			if (sym_sect_idx != SHN_UNDEF) {
+			Elf64_Sym* rel_symbol = elf_sym(rel, reloc_symtab, sym_idx);
+			if (rel_symbol->st_shndx != SHN_UNDEF) {
 				// Symbol in ET_REL
-				if (STT_SECTION == ELF64_ST_TYPE(elf_sym(rel, reloc_symtab, sym_idx)->st_info)) {
-					
-				}
-				AllocSectionInfo* sym_sect_info = alloc_find_idx(alloc, alloc_cnt, sym_sect_idx);
+				AllocSectionInfo* sym_sect_info = alloc_find_idx(alloc, alloc_cnt, rel_symbol->st_shndx);
 				sym_vaddr = sym_sect_info->vaddr + elf_sym(rel, reloc_symtab, sym_idx)->st_value;
 			}
 			else {
 				// Symbol in ET_EXEC
 				bool its_orig_start = (0 == strcmp("orig_start", sym_name));
-				sym_vaddr = its_orig_start ? out_hdr->e_entry : elf_sym_with_name(out, out_symtab, sym_name)->st_value;
+				sym_vaddr = its_orig_start ? elf_hdr(out)->e_entry : elf_sym_with_name(out, out_symtab, sym_name)->st_value;
 			}
 
 			Elf64_Addr offset = dest_info->file_off + rela->r_offset;
-			Elf64_Addr result = 0;
+			uint64_t result64 = 0;
+			uint32_t result32 = 0;
 			switch (ELF64_R_TYPE(rela->r_info)) {
 				case R_X86_64_64:
-					result = sym_vaddr + rela->r_addend;
-					*AT(uint64_t, out, offset) = result;
+					result64 = sym_vaddr + rela->r_addend;
+					memcpy(AT(uint64_t, out, offset), &result64, sizeof(result64));
 					break;
 				case R_X86_64_32:
-					result = sym_vaddr + rela->r_addend;
-					*AT(uint32_t, out, offset) = (uint32_t) result;
+					result64 = sym_vaddr + rela->r_addend;
+					result32 = (uint32_t) result64;
+					memcpy(AT(uint32_t, out, offset), &result32, sizeof(result32));
 					break;
 				case R_X86_64_32S:
-					result = sym_vaddr + rela->r_addend;
-					if ((int32_t) result != (int64_t) result) {
+					result64 = sym_vaddr + rela->r_addend;
+					result32 = (uint32_t) result64;
+					if ((int32_t) result64 != (int64_t) result64) {
 						fprintf(stderr, "%s: invalid R_X86_64_32S relocation: symbol \"%s\"\n", out->path, sym_name);
 						goto cleanup;
 					}
-					*AT(uint32_t, out, offset) = (uint32_t) sym_vaddr + rela->r_addend;
+					memcpy(AT(uint32_t, out, offset), &result32, sizeof(result32));
 					break;
 				case R_X86_64_PC32:
 				case R_X86_64_PLT32:
-					result = sym_vaddr - (dest_info->vaddr + rela->r_offset) + rela->r_addend;
-					*AT(uint32_t, out, offset) = (uint32_t) result;
+					result64 = sym_vaddr - (dest_info->vaddr + rela->r_offset) + rela->r_addend;
+					result32 = (uint32_t) result64;
+					memcpy(AT(uint32_t, out, offset), &result32, sizeof(result32));
 					break;
 			}
 
@@ -681,8 +681,8 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 	}
 
 	Elf64_Sym* start_sym = elf_sym_with_name(rel, rel_symtab, "_start");
-	out_hdr->e_entry = alloc_find_idx(alloc, alloc_cnt, start_sym->st_shndx)->vaddr + start_sym->st_value;
-	elf_sym_with_name(out, out_symtab, "_start")->st_value = out_hdr->e_entry;
+	elf_hdr(out)->e_entry = alloc_find_idx(alloc, alloc_cnt, start_sym->st_shndx)->vaddr + start_sym->st_value;
+	elf_sym_with_name(out, out_symtab, "_start")->st_value = elf_hdr(out)->e_entry;
 
 	status = true;
 
