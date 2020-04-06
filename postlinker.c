@@ -12,6 +12,7 @@ typedef struct {
 	const char* path;
 	void* addr;
 	size_t size;
+	size_t capacity;
 } MemFile;
 
 typedef struct{
@@ -74,6 +75,7 @@ bool memfile_read(MemFile* file);
 bool memfile_write(MemFile* file);
 void memfile_drop(MemFile* file);
 bool memfile_paste(MemFile* dst, size_t dst_off, MemFile* src, size_t src_off, size_t size);
+bool memfile_resize(MemFile* file, size_t new_size);
 
 
 int main(int argc, char** argv) 
@@ -82,6 +84,9 @@ int main(int argc, char** argv)
 	MemFile exec = {0};
 	MemFile rel = {0};
 	MemFile out = {0};
+	AllocSectionInfo* alloc_sect = NULL;
+	size_t alloc_sect_cnt = 0;
+	size_t new_phdr_cnt = 0;
 
 	if (argc != 4) {	
 		fprintf(stderr, "usage: %s <ET_EXEC> <ET_REL> <target ET_EXEC>\n", argv[0]);
@@ -101,15 +106,14 @@ int main(int argc, char** argv)
 		goto cleanup;
 	}
 
+	memfile_resize(&out, exec.size + rel.size + sysconf(_SC_PAGE_SIZE));
+
 	if (NULL == elf_sym_with_name_try(&rel, elf_sym_shdr(&rel), "_start")) {
 		memfile_paste(&out, 0, &exec, 0, exec.size);
 		status = true;
 		goto cleanup;
 	}
 
-	AllocSectionInfo* alloc_sect = NULL;
-	size_t alloc_sect_cnt = 0;
-	size_t new_phdr_cnt = 0;
 	if (!elf_group_sections(&rel, &alloc_sect, &alloc_sect_cnt, &new_phdr_cnt)) {
 		goto cleanup;
 	}
@@ -347,6 +351,7 @@ bool memfile_read(MemFile* file)
 		goto cleanup;
 	}
 	file->size = (size_t) ssize;
+	file->capacity = file->size;
 
 	if (0 != fseek(stream, 0, SEEK_SET)) {
 		fprintf(stderr, "%s: failed to get file size (fseek): %s\n", file->path, strerror(errno));
@@ -391,7 +396,7 @@ bool memfile_write(MemFile* file)
 	}
 
 	if (file->size > fwrite(file->addr, 1, file->size, stream)) {
-		fprintf(stderr, "%s: failed to write: fwrite\n", file->path);
+		fprintf(stderr, "%s: failed to write file: %s\n", file->path, strerror(errno));
 		goto cleanup;
 	}
 
@@ -413,16 +418,29 @@ void memfile_drop(MemFile* file)
 	}
 }
 
+bool memfile_resize(MemFile* file, size_t new_capacity)
+{
+	file->addr = realloc(file->addr, new_capacity);
+	if (NULL == file->addr) {
+		fprintf(stderr, "out of memory\n");
+		return false;
+	}
+	memset((char*) file->addr + file->size, 0, new_capacity - file->capacity);
+	file->capacity = new_capacity;
+	return true;
+}
+
 
 bool memfile_paste(MemFile* dst, size_t dst_off, MemFile* src, size_t src_off, size_t size) {
-	if (dst_off + size > dst->size) {
-		dst->addr = realloc(dst->addr, dst_off + size);
-		if (NULL == dst->addr) {
+	size_t new_size = dst_off + size;
+	if (new_size > dst->capacity) {
+		size_t new_capacity = new_size >= 2 * dst->capacity ? new_size : 2 * dst->capacity;
+		if (!memfile_resize(dst, new_capacity)) {
 			return false;
 		}
-		// Init new memory chunk
-		memset((char*) dst->addr + dst->size, 0, (dst_off + size) - dst->size);
-		dst->size = dst_off + size;
+	}
+	if (new_size > dst->size) {
+		dst->size = new_size;
 	}
 	memcpy(
 		at(dst, dst_off, size),
@@ -649,7 +667,6 @@ bool elf_reloc(MemFile* out, MemFile* rel, AllocSectionInfo* alloc_sect, size_t 
 {
 	Elf64_Shdr* out_symtab = elf_sym_shdr(out);
 	Elf64_Shdr* rel_symtab = elf_sym_shdr(rel);
-	// do relocs
 	for (size_t i = 0; i < elf_shdr_cnt(rel); ++i) {
 		Elf64_Shdr* shdr = elf_shdr(rel, i);
 		if (shdr->sh_type != SHT_RELA) {
@@ -659,7 +676,6 @@ bool elf_reloc(MemFile* out, MemFile* rel, AllocSectionInfo* alloc_sect, size_t 
 		Elf64_Shdr* reloc_symtab = elf_shdr(rel, shdr->sh_link);
 		Elf64_Section dest_sect_idx = shdr->sh_info;
 		
-		// TODO
 		AllocSectionInfo* dest_info = alloc_find_idx(alloc_sect, alloc_sect_cnt, dest_sect_idx);
 				
 		for (size_t r = 0; r < elf_rela_cnt(shdr); ++r) {
@@ -709,10 +725,10 @@ bool elf_reloc(MemFile* out, MemFile* rel, AllocSectionInfo* alloc_sect, size_t 
 					memcpy(AT(uint32_t, out, offset), &result32, sizeof(result32));
 					break;
 			}
-
 		}
 	}
 
+	// Update header e_entry and _start symbol values
 	Elf64_Sym* start_sym = elf_sym_with_name(rel, rel_symtab, "_start");
 	elf_hdr(out)->e_entry = alloc_find_idx(alloc_sect, alloc_sect_cnt, start_sym->st_shndx)->vaddr + start_sym->st_value;
 	elf_sym_with_name(out, out_symtab, "_start")->st_value = elf_hdr(out)->e_entry;
