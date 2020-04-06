@@ -57,6 +57,7 @@ size_t elf_rela_cnt(Elf64_Shdr* rela_shdr);
 size_t elf_get_program_alignment(MemFile* elf, Elf64_Word program_type);
 Elf64_Word elf_section_flags_to_program_flags(Elf64_Xword sflags);
 Elf64_Addr elf_get_free_vaddr(MemFile* elf, size_t alignment);
+bool elf_group_sections(MemFile* elf, AllocSectionInfo** out_alloc, size_t* out_sect_cnt, size_t* out_new_phdr_cnt);
 
 // Util functions
 uint64_t align_to(uint64_t alignment, uint64_t value);
@@ -70,7 +71,7 @@ void memfile_drop(MemFile* file);
 bool memfile_paste(MemFile* dst, size_t dst_off, MemFile* src, size_t src_off, size_t size);
 
 bool elf_check_sanity(MemFile* elf, Elf64_Half expected_type);
-bool elf_link(MemFile* out, MemFile* exec, MemFile* rel);
+bool elf_link(MemFile* out, MemFile* exec, MemFile* rel, AllocSectionInfo* alloc_sect, size_t alloc_sect_cnt, size_t new_phdr_cnt);
 
 int main(int argc, char** argv) 
 {
@@ -92,12 +93,25 @@ int main(int argc, char** argv)
 		goto cleanup;
 	}
 
-	if(!elf_check_sanity(&exec, ET_EXEC)
-	|| !elf_check_sanity(&rel, ET_REL)) {
+	if (!elf_check_sanity(&exec, ET_EXEC)
+	||  !elf_check_sanity(&rel, ET_REL)) {
 		goto cleanup;
 	}
 
-	if (!elf_link(&out, &exec, &rel)) {
+	if (NULL == elf_sym_with_name_try(&rel, elf_sym_shdr(&rel), "_start")) {
+		memfile_paste(&out, 0, &exec, 0, exec.size);
+		status = true;
+		goto cleanup;
+	}
+
+	AllocSectionInfo* alloc_sect = NULL;
+	size_t alloc_sect_cnt = 0;
+	size_t new_phdr_cnt = 0;
+	if (!elf_group_sections(&rel, &alloc_sect, &alloc_sect_cnt, &new_phdr_cnt)) {
+		goto cleanup;
+	}
+
+	if (!elf_link(&out, &exec, &rel, alloc_sect, alloc_sect_cnt, new_phdr_cnt)) {
 		goto cleanup;
 	}
 
@@ -108,6 +122,10 @@ int main(int argc, char** argv)
 	status = 0;
 
 cleanup:
+	if (alloc_sect != NULL) {
+		free(alloc_sect);
+		alloc_sect = NULL;
+	}
 	memfile_drop(&exec);
 	memfile_drop(&rel);
 	memfile_drop(&out);
@@ -293,7 +311,7 @@ AllocSectionInfo* alloc_find_idx(AllocSectionInfo* arr, size_t count, Elf64_Half
 			return arr + i;
 		}
 	}
-	fprintf(stderr, "could not find alloc section with orig_idx=%hu\n", orig_idx);
+	fprintf(stderr, "could not find alloc_sect section with orig_idx=%hu\n", orig_idx);
 	exit(EXIT_FAILURE);
 }
 
@@ -483,41 +501,47 @@ int elf_section_flags_cmp(const void* void_lhs, const void* void_rhs)
 	return (lhs->acc_flags < rhs->acc_flags) ? -1 : lhs->acc_flags > rhs->acc_flags;
 }
 
-bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
+bool elf_group_sections(MemFile* elf, AllocSectionInfo** out_alloc, size_t* out_sect_cnt, size_t* out_new_phdr_cnt)
 {
-	bool status = false;
-	AllocSectionInfo* alloc = NULL;
+	AllocSectionInfo* alloc_sect = NULL; // for internal use
+	*out_alloc = NULL;
+	*out_sect_cnt = 0;
+	*out_new_phdr_cnt = 0;
 
-	if (NULL == elf_sym_with_name_try(rel, elf_sym_shdr(rel), "_start")) {
-		memfile_paste(out, 0, exec, 0, exec->size);
-		status = true;
-		goto cleanup;
+	// alloc_sect space to fit all the sections in the file.
+	*out_alloc = malloc(elf_shdr_cnt(elf) * sizeof(**out_alloc));
+	if (NULL == *out_alloc) {
+		fprintf(stderr, "%s: failed to sort sections: out of memory\n", elf->path);
+		return false;
 	}
-	
-	// Group SHF_ALLOC sections in ET_REL: sort by (flags & (SHF_WRITE | SHF_EXECINSTR))
-	size_t alloc_cnt = 0;
-	alloc = malloc(elf_shdr_cnt(rel) * sizeof(*alloc));
-	if (NULL == alloc) {
-		fprintf(stderr, "%s: failed to sort sections: out of memory\n", out->path);
-		goto cleanup;
-	}
-	for (size_t i = 0; i < elf_shdr_cnt(rel); ++i) {
-		Elf64_Shdr* shdr = elf_shdr(rel, i);
+	alloc_sect = *out_alloc;
+
+	// Collect relevant info about sections
+	for (size_t i = 0; i < elf_shdr_cnt(elf); ++i) {
+		Elf64_Shdr* shdr = elf_shdr(elf, i);
 		if (shdr->sh_flags & SHF_ALLOC) {
-			alloc[alloc_cnt].orig_idx = i;
-			alloc[alloc_cnt].acc_flags = (SHF_WRITE | SHF_EXECINSTR) & shdr->sh_flags;
-			alloc_cnt += 1;
+			alloc_sect[*out_sect_cnt].orig_idx = i;
+			alloc_sect[*out_sect_cnt].acc_flags = (SHF_WRITE | SHF_EXECINSTR) & shdr->sh_flags;
+			*out_sect_cnt += 1;
 		}
 	}
-	qsort(alloc, alloc_cnt, sizeof(*alloc), elf_section_flags_cmp);
+	// Sort by (flags & (SHF_WRITE | SHF_EXECINSTR))
+	qsort(alloc_sect, *out_sect_cnt, sizeof(*alloc_sect), elf_section_flags_cmp);
 	
 	// Get number of new program headers
-	size_t new_phdr_cnt = (alloc_cnt > 0);
-	for (size_t i = 1; i < alloc_cnt; ++i) {
-		if (alloc[i].acc_flags != alloc[i-1].acc_flags) {
-			new_phdr_cnt += 1;
+	*out_new_phdr_cnt = (*out_sect_cnt > 0);
+	for (size_t i = 1; i < *out_sect_cnt; ++i) {
+		if (alloc_sect[i].acc_flags != alloc_sect[i-1].acc_flags) {
+			*out_new_phdr_cnt += 1;
 		}
 	}
+
+	return true;
+}
+
+bool elf_link(MemFile* out, MemFile* exec, MemFile* rel, AllocSectionInfo* alloc_sect, size_t alloc_sect_cnt, size_t new_phdr_cnt)
+{
+	bool status = false;
 
 	size_t out_offset = 0;
 
@@ -574,11 +598,11 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 	}
 
 	// Paste all the allocatable sections at the end of the output file
-	Elf64_Xword prev_flags = SHF_MASKOS; // anything that's != alloc[0].sh_flags
+	Elf64_Xword prev_flags = SHF_MASKOS; // anything that's != alloc_sect[0].sh_flags
 	Elf64_Addr curr_section_vaddr_offset = 0; // offset of section first byte from current segment
-	for (size_t alloc_idx = 0; alloc_idx < alloc_cnt; ++alloc_idx) {
+	for (size_t alloc_idx = 0; alloc_idx < alloc_sect_cnt; ++alloc_idx) {
 		// Copy current section
-		Elf64_Shdr* shdr = elf_shdr(rel, alloc[alloc_idx].orig_idx);
+		Elf64_Shdr* shdr = elf_shdr(rel, alloc_sect[alloc_idx].orig_idx);
 		out_offset = align_to(shdr->sh_addralign, out_offset);
 		if (!memfile_paste(out, out_offset, rel, shdr->sh_offset, shdr->sh_size)) {
 			goto cleanup;
@@ -586,7 +610,7 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 
 		// Detect section belonging to a next segment (with different access attributes).
 		// This is always taken on the first loop pass.
-		if (alloc[alloc_idx].acc_flags != prev_flags) {
+		if (alloc_sect[alloc_idx].acc_flags != prev_flags) {
 			// printf("New phdr\n");
 			elf_hdr(out)->e_phnum += 1;
 			curr_section_vaddr_offset = 0;
@@ -595,23 +619,23 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 			curr_phdr->p_offset = out_offset;
 			curr_phdr->p_filesz = 0;
 			curr_phdr->p_memsz = 0;
-			curr_phdr->p_flags = elf_section_flags_to_program_flags(alloc[alloc_idx].acc_flags);
+			curr_phdr->p_flags = elf_section_flags_to_program_flags(alloc_sect[alloc_idx].acc_flags);
 			curr_phdr->p_align = elf_get_program_alignment(exec, PT_LOAD);
 			curr_phdr->p_vaddr = curr_phdr->p_paddr = curr_phdr->p_offset + elf_get_free_vaddr(out, curr_phdr->p_align);
 		}
-		// printf("%s: 0x%zx\n", elf_shstrtab_str(rel, elf_shdr(rel, alloc[alloc_idx].orig_idx)->sh_name), out_offset);
+		// printf("%s: 0x%zx\n", elf_shstrtab_str(rel, elf_shdr(rel, alloc_sect[alloc_idx].orig_idx)->sh_name), out_offset);
 		Elf64_Phdr* curr_phdr = elf_phdr(out, elf_phdr_cnt(out) - 1);
 		// Update current segment's size
 		curr_phdr->p_filesz += shdr->sh_size;
 		curr_phdr->p_memsz  += shdr->sh_size;
 
-		alloc[alloc_idx].file_off = out_offset;
-		alloc[alloc_idx].vaddr = curr_phdr->p_vaddr + curr_section_vaddr_offset;
+		alloc_sect[alloc_idx].file_off = out_offset;
+		alloc_sect[alloc_idx].vaddr = curr_phdr->p_vaddr + curr_section_vaddr_offset;
 
 		out_offset += shdr->sh_size;
 		curr_section_vaddr_offset += shdr->sh_size;
 
-		prev_flags = alloc[alloc_idx].acc_flags;
+		prev_flags = alloc_sect[alloc_idx].acc_flags;
 	}
 
 	Elf64_Shdr* out_symtab = elf_sym_shdr(out);
@@ -627,7 +651,7 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 		Elf64_Section dest_sect_idx = shdr->sh_info;
 		
 		// TODO
-		AllocSectionInfo* dest_info = alloc_find_idx(alloc, alloc_cnt, dest_sect_idx);
+		AllocSectionInfo* dest_info = alloc_find_idx(alloc_sect, alloc_sect_cnt, dest_sect_idx);
 				
 		for (size_t r = 0; r < elf_rela_cnt(shdr); ++r) {
 			Elf64_Rela* rela = elf_rela(rel, shdr, r);
@@ -638,7 +662,7 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 			Elf64_Sym* rel_symbol = elf_sym(rel, reloc_symtab, sym_idx);
 			if (rel_symbol->st_shndx != SHN_UNDEF) {
 				// Symbol in ET_REL
-				AllocSectionInfo* sym_sect_info = alloc_find_idx(alloc, alloc_cnt, rel_symbol->st_shndx);
+				AllocSectionInfo* sym_sect_info = alloc_find_idx(alloc_sect, alloc_sect_cnt, rel_symbol->st_shndx);
 				sym_vaddr = sym_sect_info->vaddr + elf_sym(rel, reloc_symtab, sym_idx)->st_value;
 			}
 			else {
@@ -681,14 +705,14 @@ bool elf_link(MemFile* out, MemFile* exec, MemFile* rel)
 	}
 
 	Elf64_Sym* start_sym = elf_sym_with_name(rel, rel_symtab, "_start");
-	elf_hdr(out)->e_entry = alloc_find_idx(alloc, alloc_cnt, start_sym->st_shndx)->vaddr + start_sym->st_value;
+	elf_hdr(out)->e_entry = alloc_find_idx(alloc_sect, alloc_sect_cnt, start_sym->st_shndx)->vaddr + start_sym->st_value;
 	elf_sym_with_name(out, out_symtab, "_start")->st_value = elf_hdr(out)->e_entry;
 
 	status = true;
 
 cleanup:
-	if (NULL != alloc){
-		free(alloc);
+	if (NULL != alloc_sect){
+		free(alloc_sect);
 	}
 
 	return status;
