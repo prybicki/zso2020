@@ -1,0 +1,28 @@
+Program działa następująco:
+
+1) Wczytanie ELF-ów do pamięci, weryfikacja: memfile_read(...), elf_check_sanity(...)
+    Sprawdzane wartości:
+        - magic number
+        - 64 bitness
+        - little endian
+        - typ: rel lub exec odpowiednio
+        - liczba sekcji > 0, rozmiar e_shentsize pasujący do definicji w elf.h
+        - liczba segmentów > 0 (dla ET_EXEC), rozmiar e_phentsize pasujący do definicji w elf.h
+
+2) Sprawdzenie, czy plik ET_REL zawiera symbol _start, jeśli nie, to out = exec
+
+3) Interesujące informacje (vaddr, file offset) o interesujących sekcjach (z flagą SHF_ALLOC) są kopiowane do tablicy o typie AllocSectionInfo, następnie jest ona sortowana wg atrybutów dostępu. W tym momencie jest też ustalana liczba nowych nagłówków segmentów.
+
+4) Tworzony jest plik wyjściowy: elf_merge(...)
+    - Kopiowany (z ET_EXEC) jest ELF header oraz oryginalne program header-y
+    - Zostawiane jest miejsce na nowe program header-y + wyrównanie do wielokrotności rozmiaru strony
+    - Doklejona zostaje zawartość pliku ET_EXEC
+    - Poprawiane są offsety, vaddr, cokolwiek trzeba (opisane w kodzie)
+    - Doklejone zostają alokowalne sekcje z pliku ET_REL
+
+5) Wykonywane są relokacje: elf_reloc(...)
+    - Dla każdej sekcji z relokacjami:
+        - Dla każdej relokacji:
+            - Znajdź symbol w plik ET_REL, jeśli jest SHN_UNDEF, to spróbuj w ET_EXEC
+        - Wykonaj relokację
+

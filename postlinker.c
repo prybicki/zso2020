@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <elf.h>
 
+// In-memory file representation
 typedef struct {
 	const char* path;
 	void* addr;
@@ -15,6 +16,7 @@ typedef struct {
 	size_t capacity;
 } MemFile;
 
+// Data
 typedef struct{
 	Elf64_Half orig_idx;
 	Elf64_Xword acc_flags;
@@ -26,11 +28,9 @@ typedef struct{
 char* at(MemFile* file, size_t offset, size_t elemsize);
 char* at_arr(MemFile* file, size_t offset, size_t elemsize, size_t arr_sz, size_t idx);
 
-// Checks if the field is within the file
+// Typed file accessors with safety features
 #define AT(type, file, offset) ((type*) at(file, offset, sizeof(type)))
-// Checks if the array element is within the file && idx is within given bound
 #define AT_ARR(type, file, offset, arr_sz, idx) ((type*) at_arr(file, offset, sizeof(type), arr_sz, idx))
-// Checks if the whole array is within the file
 #define AT_ARR_FULL(type, file, offset, arr_sz) ((type*) at(file, offset, sizeof(type)))
 
 // ELF accessors
@@ -46,10 +46,10 @@ const char* elf_strtab_str(MemFile* elf, Elf64_Shdr* strtab_shdr, size_t idx);
 
 Elf64_Shdr* elf_sym_shdr(MemFile* elf);
 Elf64_Sym* elf_sym(MemFile* elf, Elf64_Shdr* syms_shdr, size_t sym_idx);
-size_t elf_sym_cnt(Elf64_Shdr* syms_shdr);
-const char* elf_sym_name(MemFile* elf, Elf64_Shdr* syms_shdr, size_t sym_idx);
 Elf64_Sym* elf_sym_with_name(MemFile* elf, Elf64_Shdr* syms_shdr, const char* name);
 Elf64_Sym* elf_sym_with_name_try(MemFile* elf, Elf64_Shdr* syms_shdr, const char* name);
+size_t elf_sym_cnt(Elf64_Shdr* syms_shdr);
+const char* elf_sym_name(MemFile* elf, Elf64_Shdr* syms_shdr, size_t sym_idx);
 
 Elf64_Rela* elf_rela(MemFile* elf, Elf64_Shdr* rela_shdr, size_t rela_idx);
 size_t elf_rela_cnt(Elf64_Shdr* rela_shdr);
@@ -144,7 +144,6 @@ cleanup:
 	return status;
 }
 
-
 char* at(MemFile* file, size_t offset, size_t elemsize) {
 	bool valid = (file->addr != NULL) && (offset + elemsize <= file->size);
 	if (!valid) {
@@ -155,7 +154,6 @@ char* at(MemFile* file, size_t offset, size_t elemsize) {
 	return (char*) file->addr + offset;
 }
 
-
 char* at_arr(MemFile* file, size_t offset, size_t elemsize, size_t arr_sz, size_t idx) {
 	if (idx >= arr_sz) {
 		fprintf(stderr, "%s: out of bounds array access @%zu[%zu >= %zu]\n",
@@ -165,23 +163,19 @@ char* at_arr(MemFile* file, size_t offset, size_t elemsize, size_t arr_sz, size_
 	return at(file, offset + idx * elemsize, elemsize);
 }
 
-
 Elf64_Ehdr* elf_hdr(MemFile* elf) {
 	return AT(Elf64_Ehdr, elf, 0);
 }
-
 
 Elf64_Shdr* elf_shdr(MemFile* elf, size_t idx) {
 	Elf64_Ehdr* out_hdr = elf_hdr(elf);
 	return AT_ARR(Elf64_Shdr, elf, out_hdr->e_shoff, out_hdr->e_shnum, idx);
 }
 
-
 Elf64_Phdr* elf_phdr(MemFile* elf, size_t idx) {
 	Elf64_Ehdr* out_hdr = elf_hdr(elf);
 	return AT_ARR(Elf64_Phdr, elf, out_hdr->e_phoff, out_hdr->e_phnum, idx);
 }
-
 
 size_t elf_shdr_cnt(MemFile* elf) {
 	Elf64_Ehdr* out_hdr = elf_hdr(elf);
@@ -192,11 +186,9 @@ size_t elf_shdr_cnt(MemFile* elf) {
 	return (size_t) out_hdr->e_shnum;
 }
 
-
 size_t elf_phdr_cnt(MemFile* elf) {
 	return (size_t) elf_hdr(elf)->e_phnum;
 }
-
 
 Elf64_Shdr* elf_sym_shdr(MemFile* elf) {
 	for (size_t i = 0; i < elf_shdr_cnt(elf); ++i) {
@@ -209,16 +201,13 @@ Elf64_Shdr* elf_sym_shdr(MemFile* elf) {
 	exit(EXIT_FAILURE);
 }
 
-
 Elf64_Sym* elf_sym(MemFile* elf, Elf64_Shdr* syms_shdr, size_t sym_idx) {
 	return AT_ARR(Elf64_Sym, elf, syms_shdr->sh_offset, elf_sym_cnt(syms_shdr), sym_idx);
 }
 
-
 size_t elf_sym_cnt(Elf64_Shdr* syms_shdr) {
 	return syms_shdr->sh_size / syms_shdr->sh_entsize;
 }
-
 
 const char* elf_shstrtab_str(MemFile* elf, size_t idx) {
 	Elf64_Shdr* strtab = elf_shdr(elf, elf_hdr(elf)->e_shstrndx);
@@ -240,11 +229,9 @@ const char* elf_strtab_str(MemFile* elf, Elf64_Shdr* strtab_shdr, size_t idx) {
 	return AT_ARR(const char, elf, strtab_shdr->sh_offset, strtab_shdr->sh_size, idx);
 }
 
-
 const char* elf_sym_name(MemFile* elf, Elf64_Shdr* syms_shdr, size_t sym_idx) {
 	return elf_strtab_str(elf, elf_strtab(elf), elf_sym(elf, syms_shdr, sym_idx)->st_name);
 }
-
 
 Elf64_Sym* elf_sym_with_name_try(MemFile* elf, Elf64_Shdr* syms_shdr, const char* name) {
 	for (size_t i = 0; i < elf_sym_cnt(syms_shdr); ++i) {
@@ -254,7 +241,6 @@ Elf64_Sym* elf_sym_with_name_try(MemFile* elf, Elf64_Shdr* syms_shdr, const char
 	}
 	return NULL;
 }
-
 
 Elf64_Sym* elf_sym_with_name(MemFile* elf, Elf64_Shdr* syms_shdr, const char* name) {
 	Elf64_Sym* result = elf_sym_with_name_try(elf, syms_shdr, name);
@@ -284,7 +270,6 @@ size_t elf_get_program_alignment(MemFile* elf, Elf64_Word program_type)
 	return 1;
 }
 
-
 Elf64_Word elf_section_flags_to_program_flags(Elf64_Xword sflags)
 {
 	Elf64_Word program = 0;
@@ -293,7 +278,6 @@ Elf64_Word elf_section_flags_to_program_flags(Elf64_Xword sflags)
 	program |= (sflags & SHF_EXECINSTR) ? PF_X : 0;
 	return program;
 }
-
 
 Elf64_Addr elf_get_free_vaddr(MemFile* elf, size_t alignment)
 {
@@ -305,7 +289,6 @@ Elf64_Addr elf_get_free_vaddr(MemFile* elf, size_t alignment)
 	}
 	return align_to(alignment, highest);
 }
-
 
 uint64_t align_to(uint64_t alignment, uint64_t value)
 {
@@ -325,7 +308,6 @@ AllocSectionInfo* alloc_find_idx(AllocSectionInfo* arr, size_t count, Elf64_Half
 	fprintf(stderr, "could not find alloc_sect section with orig_idx=%hu\n", orig_idx);
 	exit(EXIT_FAILURE);
 }
-
 
 bool memfile_read(MemFile* file)
 {
@@ -383,7 +365,6 @@ cleanup:
 	return status;
 }
 
-
 bool memfile_write(MemFile* file)
 {
 	bool status = false;
@@ -409,7 +390,6 @@ cleanup:
 	return status;
 }
 
-
 void memfile_drop(MemFile* file)
 {
 	if (file->addr != NULL) {
@@ -430,7 +410,6 @@ bool memfile_resize(MemFile* file, size_t new_capacity)
 	return true;
 }
 
-
 bool memfile_paste(MemFile* dst, size_t dst_off, MemFile* src, size_t src_off, size_t size) {
 	size_t new_size = dst_off + size;
 	if (new_size > dst->capacity) {
@@ -449,7 +428,6 @@ bool memfile_paste(MemFile* dst, size_t dst_off, MemFile* src, size_t src_off, s
 	);
 	return true;
 }
-
 
 bool elf_check_sanity(MemFile* elf, Elf64_Half expected_type)
 {
@@ -507,14 +485,6 @@ bool elf_check_sanity(MemFile* elf, Elf64_Half expected_type)
 		return false;
 	}
 
-	// TODO verify if it's needed / guaranteed by ELF
-	// Verify assumption that there's nothing between Ehdr and Phdr:
-	if (out_hdr->e_type == ET_EXEC && out_hdr->e_phoff != sizeof(Elf64_Ehdr)) {
-		fprintf(stderr, "%s: program header not directly after elf header (%zu != %zu)\n", 
-		        elf->path, out_hdr->e_phoff, sizeof(Elf64_Ehdr));
-		return false;
-	}
-
 	return true;
 }
 
@@ -528,17 +498,18 @@ int elf_section_flags_cmp(const void* void_lhs, const void* void_rhs)
 
 bool elf_group_sections(MemFile* elf, AllocSectionInfo** out_alloc, size_t* out_sect_cnt, size_t* out_new_phdr_cnt)
 {
-	AllocSectionInfo* alloc_sect = NULL; // for internal use
+	AllocSectionInfo* alloc_sect = NULL;
 	*out_alloc = NULL;
 	*out_sect_cnt = 0;
 	*out_new_phdr_cnt = 0;
 
-	// alloc_sect space to fit all the sections in the file.
+	// Alloc space to fit all the sections in the file
 	*out_alloc = malloc(elf_shdr_cnt(elf) * sizeof(**out_alloc));
 	if (NULL == *out_alloc) {
 		fprintf(stderr, "%s: failed to sort sections: out of memory\n", elf->path);
 		return false;
 	}
+	// To avoid double dererefence
 	alloc_sect = *out_alloc;
 
 	// Collect relevant info about sections
@@ -674,8 +645,8 @@ bool elf_reloc(MemFile* out, MemFile* rel, AllocSectionInfo* alloc_sect, size_t 
 		}
 
 		Elf64_Shdr* reloc_symtab = elf_shdr(rel, shdr->sh_link);
+		// Find target section
 		Elf64_Section dest_sect_idx = shdr->sh_info;
-		
 		AllocSectionInfo* dest_info = alloc_find_idx(alloc_sect, alloc_sect_cnt, dest_sect_idx);
 				
 		for (size_t r = 0; r < elf_rela_cnt(shdr); ++r) {
@@ -683,8 +654,8 @@ bool elf_reloc(MemFile* out, MemFile* rel, AllocSectionInfo* alloc_sect, size_t 
 			Elf64_Xword sym_idx = ELF64_R_SYM(rela->r_info);
 
 			Elf64_Addr sym_vaddr = 0;
-			const char* sym_name = elf_sym_name(rel, reloc_symtab, sym_idx);
 			Elf64_Sym* rel_symbol = elf_sym(rel, reloc_symtab, sym_idx);
+			const char* sym_name = elf_sym_name(rel, reloc_symtab, sym_idx);
 			if (rel_symbol->st_shndx != SHN_UNDEF) {
 				// Symbol in ET_REL
 				AllocSectionInfo* sym_sect_info = alloc_find_idx(alloc_sect, alloc_sect_cnt, rel_symbol->st_shndx);
