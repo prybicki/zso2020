@@ -1,0 +1,17 @@
+Avaliable tests:
+================
+- fstat          Test if fstat() result proper file size.
+- ftrunc         Checks if ftruncate() properly handles buffered data.
+- lseek          Verify if lseek() takes into account buffered data.
+- multi_fd       Two separate descriptors, no modifications written
+- multi_fd_sync  Two separate descriptors, write() with fsync()
+
+For each pair (write, read), (pwrite, pread), (writev, readv), (pwritev, preadv), (pwritev2, preadv2):
+- default_*    Open `tst` file without O_BUFFERED_WRITE, write sample data, read (verify).
+               All changes should be written to file
+- nosync_*     Open `tst` file with O_BUFFERED_WRITE, write sample data, read (verify).
+               File on disk should remain unchanged.
+- sync_*       As above + execute fsync()
+- partial_*    Open `tst` file with O_BUFFERED_WRITE, write part of data, fsync, write rest of data and read everyting.
+               Only first part of data should be written to file.
+

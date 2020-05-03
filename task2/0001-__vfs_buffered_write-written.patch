@@ -1,0 +1,350 @@
+From 1b734a1e73463ec2ee48ab3cd6744482bb3fcf19 Mon Sep 17 00:00:00 2001
+From: Peter Rybicki <avelov.mail@gmail.com>
+Date: Sun, 3 May 2020 17:55:27 +0200
+Subject: [PATCH] __vfs_buffered_write written
+
+---
+ fs/fcntl.c                       |   2 +-
+ fs/file_table.c                  |   9 ++
+ fs/open.c                        |   5 +
+ fs/read_write.c                  | 175 ++++++++++++++++++++++++++++++-
+ include/linux/fcntl.h            |   2 +-
+ include/linux/fs.h               |  20 ++++
+ include/uapi/asm-generic/fcntl.h |   5 +
+ mm/mmap.c                        |   4 +
+ 8 files changed, 218 insertions(+), 4 deletions(-)
+
+diff --git a/fs/fcntl.c b/fs/fcntl.c
+index 9bc167562..1396bf8d9 100644
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -1031,7 +1031,7 @@ static int __init fcntl_init(void)
+ 	 * Exceptions: O_NONBLOCK is a two bit define on parisc; O_NDELAY
+ 	 * is defined as O_NONBLOCK on some platforms and not on others.
+ 	 */
+-	BUILD_BUG_ON(21 - 1 /* for O_RDONLY being 0 */ !=
++	BUILD_BUG_ON(22 - 1 /* for O_RDONLY being 0 */ !=
+ 		HWEIGHT32(
+ 			(VALID_OPEN_FLAGS & ~(O_NONBLOCK | O_NDELAY)) |
+ 			__FMODE_EXEC | __FMODE_NONOTIFY));
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 30d55c9a1..287931b8e 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -102,6 +102,15 @@ static struct file *__alloc_file(int flags, const struct cred *cred)
+ 	if (unlikely(!f))
+ 		return ERR_PTR(-ENOMEM);
+ 
++	if (flags & O_BUFFERED_WRITE) {
++		f->f_opt_wbuf = kzalloc(sizeof(struct zso_write_buffer), GFP_KERNEL);
++		if (f->f_opt_wbuf == NULL) {
++			file_free_rcu(&f->f_u.fu_rcuhead);
++			return ERR_PTR(-ENOMEM);
++		}
++		INIT_LIST_HEAD(&f->f_opt_wbuf->entries);
++	}
++
+ 	f->f_cred = get_cred(cred);
+ 	error = security_file_alloc(f);
+ 	if (unlikely(error)) {
+diff --git a/fs/open.c b/fs/open.c
+index b62f5c092..26c143152 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -966,6 +966,11 @@ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *o
+ 	 */
+ 	flags &= VALID_OPEN_FLAGS;
+ 
++	if ((flags & O_BUFFERED_WRITE) && (flags & O_APPEND)) {
++		printk(KERN_NOTICE "open: attempted both O_APPEND and O_BUFFERED_FALGS\n");
++		return -EINVAL;
++	}
++
+ 	if (flags & (O_CREAT | __O_TMPFILE))
+ 		op->mode = (mode & S_IALLUGO) | S_IFREG;
+ 	else
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 7458fccc5..7fe930199 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -458,7 +458,16 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+ 	if (!ret) {
+ 		if (count > MAX_RW_COUNT)
+ 			count =  MAX_RW_COUNT;
+-		ret = __vfs_read(file, buf, count, pos);
++
++		if (file->f_opt_wbuf) {
++			// iter over writes, based on read range select required writes
++			// 
++
++			ret = 0;
++		}
++		else {
++			ret = __vfs_read(file, buf, count, pos);
++		}
+ 		if (ret > 0) {
+ 			fsnotify_access(file);
+ 			add_rchar(current, ret);
+@@ -498,6 +507,163 @@ static ssize_t __vfs_write(struct file *file, const char __user *p,
+ 		return -EINVAL;
+ }
+ 
++static ssize_t __vfs_buffered_write(struct file *file, const char __user *p, size_t count, loff_t *pos)
++{
++	ssize_t status = 0;
++	struct zso_write_entry *entry = NULL, *new_entry = NULL, *first = NULL, *last = NULL, *surrounding = NULL;
++	ssize_t prefix_len = 0, suffix_len = 0;
++	ssize_t entry_data_pos = 0;
++	ssize_t inner_entries = 0;
++	struct list_head *iter = NULL, *tmp = NULL, *end = NULL;
++
++	// TODO fix types
++	ssize_t write_beg = *pos;
++	ssize_t write_end = *pos + count;
++
++	// TODO detect special case where we write inside some block
++	// TODO check off by ones :)
++	
++	// Find range of entries that are either adjacent or intersecting
++	list_for_each_entry(entry, &file->f_opt_wbuf->entries, list_node) {
++		if (write_end < entry->beg)
++			break;
++
++		if (entry->beg <= write_beg && write_end <= entry->end) {
++			surrounding = entry;
++			break;
++		}
++
++		if (first == NULL && write_beg <= entry->end && entry->end <= write_end) {
++			first = entry;
++			prefix_len = max(0L, write_beg - entry->beg);
++		}
++
++		if (write_beg <= entry->beg && entry->beg <= write_end) {
++			last = entry;
++			suffix_len = max(0L, entry->end - write_end);
++		}
++
++		if (first != NULL || last != NULL)
++			inner_entries += 1;
++	}
++
++	printk(KERN_NOTICE "write: [%zd, %zd) inner_entries=%zd\n", write_beg, write_end, inner_entries);
++	if (first != NULL)
++		printk(KERN_NOTICE "write: first=[%zd, %zd), prefix=%zd\n", first->beg, first->end, prefix_len);
++	if (last != NULL)
++		printk(KERN_NOTICE "write: last=[%zd, %zd), suffix=%zd\n", last->beg, last->end, suffix_len);
++	if (surrounding != NULL)
++		printk(KERN_NOTICE "write: surrounding=[%zd, %zd)\n", surrounding->beg, surrounding->end);
++
++	// The only case that does not require reallocation
++	// write call is inside <surrounding> entry.
++	if (surrounding != NULL) {
++		if (copy_from_user(entry->data + (write_beg - entry->beg), p, count) != count) {
++			printk(KERN_NOTICE "write: copy_from_user [surr] failed\n");
++			return -EFAULT;
++		}
++		return *pos = count;
++	}
++
++	// Allocating cases here:
++
++	new_entry = kzalloc(sizeof(struct zso_write_entry), GFP_KERNEL);
++	if (new_entry == NULL) {
++		printk(KERN_NOTICE "write: kzalloc failed\n");
++		status = -ENOMEM;
++		goto cleanup;
++	}
++	INIT_LIST_HEAD(&new_entry->list_node);
++	new_entry->beg = (first != NULL) ? first->beg : write_beg;
++	new_entry->end = (last != NULL) ? last->end : write_end;
++	ssize_t new_entry_size = new_entry->end - new_entry->beg;
++	new_entry->data = vzalloc(new_entry_size);
++	if (new_entry->data == NULL) {
++		printk(KERN_NOTICE "write: vzalloc failed\n");
++		status = -ENOMEM;
++		goto cleanup;
++	}
++
++	printk(KERN_NOTICE "write: new entry: beg=%zd, end=%zd, sz=%zd\n", new_entry->beg, new_entry->end, new_entry_size);
++
++	// copy prefix chunk data
++	if (prefix_len > 0) {
++		memcpy(new_entry->data + entry_data_pos, first->data, prefix_len);
++		entry_data_pos += prefix_len;
++	}
++
++	// copy actual write
++	if (copy_from_user(new_entry->data + entry_data_pos, p, count) > 0) {
++		printk(KERN_NOTICE "write: copy_from_user [norm] failed\n");
++		status = -EFAULT;
++		goto cleanup;
++	}
++	entry_data_pos += count;
++
++	// copy suffix chunk data
++	if (suffix_len > 0) {
++		/// here
++		memcpy(new_entry->data + entry_data_pos, last->data + (write_end - last->beg), suffix_len);
++		entry_data_pos += count;
++	}
++
++	printk(KERN_NOTICE "write: zso_write_entry done\n");
++
++	// Remove unused entries
++
++	if (first != NULL && last != NULL) {
++
++		end = last->list_node.next;
++		for (iter = &first->list_node, tmp = iter->next; iter != end; iter = tmp, tmp = iter->next) {
++			entry = list_entry(iter, struct zso_write_entry, list_node);
++			list_del(iter);
++			printk(KERN_NOTICE "write: removing entry: beg=%zd, end=%zd\n", )
++			vfree(entry->data);
++			kfree(entry);
++		}
++	} 
++	else if (first != NULL || last != NULL) {
++		// TODO merge with above with some trick
++		iter = (first != NULL) ? &first->list_node : &last->list_node;
++		entry = list_entry(iter, struct zso_write_entry, list_node);
++		list_del(iter);
++		vfree(entry->data);
++		kfree(entry);
++	}
++
++	// Add the new_entry:
++	if (list_empty(&file->f_opt_wbuf->entries)) {
++		iter = &file->f_opt_wbuf->entries;
++	}
++	else {
++		list_for_each(iter, &file->f_opt_wbuf->entries) {
++			entry = list_entry(iter, struct zso_write_entry, list_node);
++			if (new_entry->beg > entry->beg) {
++				iter = iter->prev;
++				break;
++			}
++		}
++	}
++	list_add(&new_entry->list_node, iter);
++	file->f_opt_wbuf->entry_count += 1;
++
++	// TODO add printks, test it xD
++
++	*pos = entry_data_pos;
++	printk(KERN_NOTICE "write: normal return\n");
++	return status;
++
++cleanup:
++	if (new_entry != NULL) {
++		if (new_entry->data != NULL) {
++			vfree(new_entry->data);
++		}
++		kfree(new_entry);
++	}
++	printk(KERN_NOTICE "write: cleanup return\n");
++	return status;
++}
++
+ ssize_t __kernel_write(struct file *file, const void *buf, size_t count, loff_t *pos)
+ {
+ 	mm_segment_t old_fs;
+@@ -555,7 +721,12 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
+ 		if (count > MAX_RW_COUNT)
+ 			count =  MAX_RW_COUNT;
+ 		file_start_write(file);
+-		ret = __vfs_write(file, buf, count, pos);
++		if (file->f_flags & O_BUFFERED_WRITE) {
++			ret = __vfs_buffered_write(file, buf, count, pos);
++		}
++		else {
++			ret = __vfs_write(file, buf, count, pos);
++		}
+ 		if (ret > 0) {
+ 			fsnotify_modify(file);
+ 			add_wchar(current, ret);
+diff --git a/include/linux/fcntl.h b/include/linux/fcntl.h
+index d019df946..33e9a491a 100644
+--- a/include/linux/fcntl.h
++++ b/include/linux/fcntl.h
+@@ -9,7 +9,7 @@
+ 	(O_RDONLY | O_WRONLY | O_RDWR | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | \
+ 	 O_APPEND | O_NDELAY | O_NONBLOCK | O_NDELAY | __O_SYNC | O_DSYNC | \
+ 	 FASYNC	| O_DIRECT | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | \
+-	 O_NOATIME | O_CLOEXEC | O_PATH | __O_TMPFILE)
++	 O_NOATIME | O_CLOEXEC | O_PATH | __O_TMPFILE | O_BUFFERED_WRITE)
+ 
+ #ifndef force_o_largefile
+ #define force_o_largefile() (!IS_ENABLED(CONFIG_ARCH_32BIT_OFF_T))
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 98e0349ad..1f59909cd 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -932,6 +932,23 @@ static inline int ra_has_index(struct file_ra_state *ra, pgoff_t index)
+ 		index <  ra->start + ra->size);
+ }
+ 
++#define ZSO_VMALLOC_THRESHOLD (16 * 1024)
++
++// Represents continuous area written by user,
++// possibly by >1 calls to write.
++struct zso_write_entry {
++	char* data;
++	ssize_t beg;
++	ssize_t end;
++	struct list_head list_node;
++};
++
++struct zso_write_buffer {
++	// Entries are sorted
++	struct list_head entries; 
++	ssize_t entry_count;
++};
++
+ struct file {
+ 	union {
+ 		struct llist_node	fu_llist;
+@@ -941,6 +958,9 @@ struct file {
+ 	struct inode		*f_inode;	/* cached value */
+ 	const struct file_operations	*f_op;
+ 
++	// TODO locking
++	struct zso_write_buffer *f_opt_wbuf;
++
+ 	/*
+ 	 * Protects f_ep_links, f_flags.
+ 	 * Must not be taken from IRQ context.
+diff --git a/include/uapi/asm-generic/fcntl.h b/include/uapi/asm-generic/fcntl.h
+index 9dc0bf0c5..c187032ae 100644
+--- a/include/uapi/asm-generic/fcntl.h
++++ b/include/uapi/asm-generic/fcntl.h
+@@ -89,6 +89,11 @@
+ #define __O_TMPFILE	020000000
+ #endif
+ 
++#ifndef O_BUFFERED_WRITE
++#define O_BUFFERED_WRITE 040000000	/* buffer user writes */
++#endif
++
++
+ /* a horrid kludge trying to make sure that this will fail on old kernels */
+ #define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
+ #define O_TMPFILE_MASK (__O_TMPFILE | O_DIRECTORY | O_CREAT)      
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 71e4ffc83..5f6a2947c 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1568,6 +1568,10 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
+ 		file = fget(fd);
+ 		if (!file)
+ 			return -EBADF;
++		if (file->f_flags & O_BUFFERED_WRITE) {
++			printk(KERN_NOTICE "mmap: attempted to mmap O_BUFFERED_WRITE file\n");
++			return -EINVAL;
++		}
+ 		if (is_file_hugepages(file))
+ 			len = ALIGN(len, huge_page_size(hstate_file(file)));
+ 		retval = -EINVAL;
+-- 
+2.17.1
+
