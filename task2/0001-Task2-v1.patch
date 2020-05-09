@@ -1,0 +1,869 @@
+From 433cc1caf6541695cb5b1fa38c0c35ad4d89a92c Mon Sep 17 00:00:00 2001
+From: Peter Rybicki <avelov.mail@gmail.com>
+Date: Sun, 3 May 2020 17:55:27 +0200
+Subject: [PATCH] Task2 v1
+
+---
+ fs/Makefile                      |   2 +-
+ fs/fcntl.c                       |   2 +-
+ fs/file_table.c                  |  14 +-
+ fs/internal.h                    |   2 +-
+ fs/open.c                        |  24 ++-
+ fs/read_write.c                  |  52 ++++-
+ fs/splice.c                      |  16 +-
+ fs/stat.c                        |   4 +
+ fs/sync.c                        |  23 +-
+ fs/zso.c                         | 359 +++++++++++++++++++++++++++++++
+ include/linux/fcntl.h            |   2 +-
+ include/linux/fs.h               |  28 +++
+ include/linux/syscalls.h         |   4 +-
+ include/uapi/asm-generic/fcntl.h |   5 +
+ mm/mmap.c                        |   2 +
+ 15 files changed, 509 insertions(+), 30 deletions(-)
+ create mode 100644 fs/zso.c
+
+diff --git a/fs/Makefile b/fs/Makefile
+index 1148c555c..b2fe798ac 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -13,7 +13,7 @@ obj-y :=	open.o read_write.o file_table.o super.o \
+ 		seq_file.o xattr.o libfs.o fs-writeback.o \
+ 		pnode.o splice.o sync.o utimes.o d_path.o \
+ 		stack.o fs_struct.o statfs.o fs_pin.o nsfs.o \
+-		fs_types.o fs_context.o fs_parser.o fsopen.o
++		fs_types.o fs_context.o fs_parser.o fsopen.o zso.o
+ 
+ ifeq ($(CONFIG_BLOCK),y)
+ obj-y +=	buffer.o block_dev.o direct-io.o mpage.o
+diff --git a/fs/fcntl.c b/fs/fcntl.c
+index 9bc167562..1396bf8d9 100644
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -1031,7 +1031,7 @@ static int __init fcntl_init(void)
+ 	 * Exceptions: O_NONBLOCK is a two bit define on parisc; O_NDELAY
+ 	 * is defined as O_NONBLOCK on some platforms and not on others.
+ 	 */
+-	BUILD_BUG_ON(21 - 1 /* for O_RDONLY being 0 */ !=
++	BUILD_BUG_ON(22 - 1 /* for O_RDONLY being 0 */ !=
+ 		HWEIGHT32(
+ 			(VALID_OPEN_FLAGS & ~(O_NONBLOCK | O_NDELAY)) |
+ 			__FMODE_EXEC | __FMODE_NONOTIFY));
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 30d55c9a1..fbec4fad0 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -104,9 +104,13 @@ static struct file *__alloc_file(int flags, const struct cred *cred)
+ 
+ 	f->f_cred = get_cred(cred);
+ 	error = security_file_alloc(f);
+-	if (unlikely(error)) {
+-		file_free_rcu(&f->f_u.fu_rcuhead);
+-		return ERR_PTR(error);
++	if (unlikely(error))
++		goto failed;
++
++	if (flags & O_BUFFERED_WRITE) {
++		error = zso_write_buffer_create(f, &f->f_opt_wbuf);
++		if (unlikely(error))
++			goto failed;
+ 	}
+ 
+ 	atomic_long_set(&f->f_count, 1);
+@@ -119,6 +123,10 @@ static struct file *__alloc_file(int flags, const struct cred *cred)
+ 	/* f->f_version: 0 */
+ 
+ 	return f;
++
++failed:
++	file_free_rcu(&f->f_u.fu_rcuhead);
++	return ERR_PTR(error);
+ }
+ 
+ /* Find an unused file structure and return a pointer to it.
+diff --git a/fs/internal.h b/fs/internal.h
+index e3fa69544..708390d3e 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -125,7 +125,7 @@ extern struct file *do_filp_open(int dfd, struct filename *pathname,
+ extern struct file *do_file_open_root(struct dentry *, struct vfsmount *,
+ 		const char *, const struct open_flags *);
+ 
+-long do_sys_ftruncate(unsigned int fd, loff_t length, int small);
++long do_sys_ftruncate(unsigned int fd, loff_t length, int small, bool omit_buffering);
+ long do_faccessat(int dfd, const char __user *filename, int mode);
+ int do_fchmodat(int dfd, const char __user *filename, umode_t mode);
+ int do_fchownat(int dfd, const char __user *filename, uid_t user, gid_t group,
+diff --git a/fs/open.c b/fs/open.c
+index b62f5c092..010e62b0a 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -152,7 +152,7 @@ COMPAT_SYSCALL_DEFINE2(truncate, const char __user *, path, compat_off_t, length
+ }
+ #endif
+ 
+-long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
++long do_sys_ftruncate(unsigned int fd, loff_t length, int small, bool omit_buffering)
+ {
+ 	struct inode *inode;
+ 	struct dentry *dentry;
+@@ -187,6 +187,14 @@ long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
+ 	if (IS_APPEND(file_inode(f.file)))
+ 		goto out_putf;
+ 
++	// Intercept ftruncate on buffered files.
++	// However, fsync(buffered file) needs actual ftruncate.
++	// This is controlled by omit_buffering flag.
++	if (f.file->f_flags & O_BUFFERED_WRITE && !omit_buffering) {
++		error = zso_buffered_truncate(f.file, length);
++		goto out_putf;
++	}
++
+ 	sb_start_write(inode->i_sb);
+ 	error = locks_verify_truncate(inode, f.file, length);
+ 	if (!error)
+@@ -202,13 +210,13 @@ long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
+ 
+ SYSCALL_DEFINE2(ftruncate, unsigned int, fd, unsigned long, length)
+ {
+-	return do_sys_ftruncate(fd, length, 1);
++	return do_sys_ftruncate(fd, length, 1, false);
+ }
+ 
+ #ifdef CONFIG_COMPAT
+ COMPAT_SYSCALL_DEFINE2(ftruncate, unsigned int, fd, compat_ulong_t, length)
+ {
+-	return do_sys_ftruncate(fd, length, 1);
++	return do_sys_ftruncate(fd, length, 1, false);
+ }
+ #endif
+ 
+@@ -221,7 +229,7 @@ SYSCALL_DEFINE2(truncate64, const char __user *, path, loff_t, length)
+ 
+ SYSCALL_DEFINE2(ftruncate64, unsigned int, fd, loff_t, length)
+ {
+-	return do_sys_ftruncate(fd, length, 0);
++	return do_sys_ftruncate(fd, length, 0, false);
+ }
+ #endif /* BITS_PER_LONG == 32 */
+ 
+@@ -966,6 +974,9 @@ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *o
+ 	 */
+ 	flags &= VALID_OPEN_FLAGS;
+ 
++	if ((flags & O_BUFFERED_WRITE) && (flags & O_APPEND))
++		return -EINVAL;
++
+ 	if (flags & (O_CREAT | __O_TMPFILE))
+ 		op->mode = (mode & S_IALLUGO) | S_IFREG;
+ 	else
+@@ -1101,6 +1112,8 @@ long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
+ 		} else {
+ 			fsnotify_open(f);
+ 			fd_install(fd, f);
++			if (f->f_flags & O_BUFFERED_WRITE)
++				f->f_opt_wbuf->file_size = f->f_inode->i_size;
+ 		}
+ 	}
+ 	putname(tmp);
+@@ -1170,6 +1183,9 @@ int filp_close(struct file *filp, fl_owner_t id)
+ 		return 0;
+ 	}
+ 
++	if (filp->f_flags & O_BUFFERED_WRITE)
++		zso_write_buffer_destroy(filp->f_opt_wbuf);
++
+ 	if (filp->f_op->flush)
+ 		retval = filp->f_op->flush(filp, id);
+ 
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 7458fccc5..3f06c0853 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -292,11 +292,15 @@ loff_t vfs_llseek(struct file *file, loff_t offset, int whence)
+ {
+ 	loff_t (*fn)(struct file *, loff_t, int);
+ 
++	if ((file->f_flags & O_BUFFERED_WRITE) && whence == SEEK_END)
++		return vfs_setpos(file, file->f_opt_wbuf->file_size, file->f_inode->i_sb->s_maxbytes);
++
+ 	fn = no_llseek;
+ 	if (file->f_mode & FMODE_LSEEK) {
+ 		if (file->f_op->llseek)
+ 			fn = file->f_op->llseek;
+ 	}
++
+ 	return fn(file, offset, whence);
+ }
+ EXPORT_SYMBOL(vfs_llseek);
+@@ -458,11 +462,18 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+ 	if (!ret) {
+ 		if (count > MAX_RW_COUNT)
+ 			count =  MAX_RW_COUNT;
+-		ret = __vfs_read(file, buf, count, pos);
+-		if (ret > 0) {
++
++		if (file->f_flags & O_BUFFERED_WRITE)
++			ret = zso_buffered_read(file, buf, count, pos);
++		else
++			ret = __vfs_read(file, buf, count, pos);
++
++		// Skip fsnotify when writing to O_BUFFERED_WRITE file.
++		if (ret > 0 && !(file->f_flags & O_BUFFERED_WRITE))
+ 			fsnotify_access(file);
++		if (ret > 0) 
+ 			add_rchar(current, ret);
+-		}
++
+ 		inc_syscr(current);
+ 	}
+ 
+@@ -554,6 +565,15 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
+ 	if (!ret) {
+ 		if (count > MAX_RW_COUNT)
+ 			count =  MAX_RW_COUNT;
++
++		if (file->f_flags & O_BUFFERED_WRITE) {
++			ret = zso_buffered_write(file, buf, count, pos);
++			if (ret > 0) 
++				add_wchar(current, ret);
++			inc_syscw(current);
++			return ret;
++		}
++		
+ 		file_start_write(file);
+ 		ret = __vfs_write(file, buf, count, pos);
+ 		if (ret > 0) {
+@@ -706,16 +726,22 @@ static ssize_t do_loop_readv_writev(struct file *filp, struct iov_iter *iter,
+ 	if (flags & ~RWF_HIPRI)
+ 		return -EOPNOTSUPP;
+ 
++	if (filp->f_flags & O_BUFFERED_WRITE)
++		if (0 != mutex_lock_interruptible(&filp->f_opt_wbuf->mutex))
++			return -ERESTARTSYS;
++
+ 	while (iov_iter_count(iter)) {
+ 		struct iovec iovec = iov_iter_iovec(iter);
+ 		ssize_t nr;
+ 
+-		if (type == READ) {
+-			nr = filp->f_op->read(filp, iovec.iov_base,
+-					      iovec.iov_len, ppos);
++		if (filp->f_flags & O_BUFFERED_WRITE) {
++			nr = (type == READ)
++			   ? zso_buffered_read_locked(filp, iovec.iov_base, iovec.iov_len, ppos)
++			   : zso_buffered_write_locked(filp, iovec.iov_base, iovec.iov_len, ppos);
+ 		} else {
+-			nr = filp->f_op->write(filp, iovec.iov_base,
+-					       iovec.iov_len, ppos);
++			nr = (type == READ)
++			   ? filp->f_op->read(filp, iovec.iov_base, iovec.iov_len, ppos)
++			   : filp->f_op->write(filp, iovec.iov_base, iovec.iov_len, ppos);
+ 		}
+ 
+ 		if (nr < 0) {
+@@ -729,6 +755,9 @@ static ssize_t do_loop_readv_writev(struct file *filp, struct iov_iter *iter,
+ 		iov_iter_advance(iter, nr);
+ 	}
+ 
++	if (filp->f_flags & O_BUFFERED_WRITE)
++		mutex_unlock(&filp->f_opt_wbuf->mutex);
++
+ 	return ret;
+ }
+ 
+@@ -929,7 +958,7 @@ static ssize_t do_iter_read(struct file *file, struct iov_iter *iter,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (file->f_op->read_iter)
++	if (file->f_op->read_iter && !(file->f_flags & O_BUFFERED_WRITE))
+ 		ret = do_iter_readv_writev(file, iter, pos, READ, flags);
+ 	else
+ 		ret = do_loop_readv_writev(file, iter, pos, READ, flags);
+@@ -966,7 +995,7 @@ static ssize_t do_iter_write(struct file *file, struct iov_iter *iter,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (file->f_op->write_iter)
++	if (file->f_op->write_iter && !(file->f_flags & O_BUFFERED_WRITE))
+ 		ret = do_iter_readv_writev(file, iter, pos, WRITE, flags);
+ 	else
+ 		ret = do_loop_readv_writev(file, iter, pos, WRITE, flags);
+@@ -1449,6 +1478,9 @@ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
+ 		count = max - pos;
+ 	}
+ 
++	if ((in.file->f_flags & O_BUFFERED_WRITE) || (out.file->f_flags & O_BUFFERED_WRITE))
++		return -EINVAL;
++
+ 	fl = 0;
+ #if 0
+ 	/*
+diff --git a/fs/splice.c b/fs/splice.c
+index 3009652a4..1552689a8 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -1118,6 +1118,9 @@ static long do_splice(struct file *in, loff_t __user *off_in,
+ 	loff_t offset;
+ 	long ret;
+ 
++	if ((in->f_flags & O_BUFFERED_WRITE) || (out->f_flags & O_BUFFERED_WRITE))
++		return -EINVAL;
++
+ 	ipipe = get_pipe_info(in);
+ 	opipe = get_pipe_info(out);
+ 
+@@ -1360,6 +1363,9 @@ static int vmsplice_type(struct fd f, int *type)
+  */
+ static long do_vmsplice(struct file *f, struct iov_iter *iter, unsigned int flags)
+ {
++	if (f->f_flags & O_BUFFERED_WRITE)
++		return -EINVAL;
++
+ 	if (unlikely(flags & ~SPLICE_F_ALL))
+ 		return -EINVAL;
+ 
+@@ -1766,10 +1772,16 @@ static int link_pipe(struct pipe_inode_info *ipipe,
+ static long do_tee(struct file *in, struct file *out, size_t len,
+ 		   unsigned int flags)
+ {
+-	struct pipe_inode_info *ipipe = get_pipe_info(in);
+-	struct pipe_inode_info *opipe = get_pipe_info(out);
++	struct pipe_inode_info *ipipe;
++	struct pipe_inode_info *opipe;
+ 	int ret = -EINVAL;
+ 
++	if ((in->f_flags & O_BUFFERED_WRITE) || (out->f_flags & O_BUFFERED_WRITE))
++		return -EINVAL;
++
++	ipipe = get_pipe_info(in);
++	opipe = get_pipe_info(out);
++
+ 	/*
+ 	 * Duplicate the contents of ipipe to opipe without actually
+ 	 * copying the data.
+diff --git a/fs/stat.c b/fs/stat.c
+index c38e4c2e1..cdef204a7 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -144,6 +144,10 @@ int vfs_statx_fd(unsigned int fd, struct kstat *stat,
+ 	if (f.file) {
+ 		error = vfs_getattr(&f.file->f_path, stat,
+ 				    request_mask, query_flags);
++		
++		if (!error && f.file->f_flags & O_BUFFERED_WRITE) 
++			stat->size = f.file->f_opt_wbuf->file_size;
++		
+ 		fdput(f);
+ 	}
+ 	return error;
+diff --git a/fs/sync.c b/fs/sync.c
+index 4d1ff010b..270d80c7a 100644
+--- a/fs/sync.c
++++ b/fs/sync.c
+@@ -215,13 +215,26 @@ EXPORT_SYMBOL(vfs_fsync);
+ static int do_fsync(unsigned int fd, int datasync)
+ {
+ 	struct fd f = fdget(fd);
+-	int ret = -EBADF;
++	long error = -EBADF;
+ 
+-	if (f.file) {
+-		ret = vfs_fsync(f.file, datasync);
+-		fdput(f);
++	if (!f.file)
++		return error;
++	
++	if (f.file->f_flags & O_BUFFERED_WRITE) {
++		// Force physical truncation to buffered size.
++		// I hope that its not a fault to nest fdget (called in do_sys_ftruncate).
++		error = do_sys_ftruncate(fd, f.file->f_opt_wbuf->file_size, 1, true);
++		if (error)
++			goto fdput;
++		error = zso_buffered_fsync(f.file);
++		if (error)
++			goto fdput;
+ 	}
+-	return ret;
++
++	error = vfs_fsync(f.file, datasync);
++fdput:
++	fdput(f);
++	return error;
+ }
+ 
+ SYSCALL_DEFINE1(fsync, unsigned int, fd)
+diff --git a/fs/zso.c b/fs/zso.c
+new file mode 100644
+index 000000000..6f642677b
+--- /dev/null
++++ b/fs/zso.c
+@@ -0,0 +1,359 @@
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++
++int zso_write_entry_create(struct zso_write_entry **out, struct zso_write_buffer *buffer, loff_t beg, loff_t end)
++{
++	struct zso_write_entry *entry;
++
++	entry = kmem_cache_alloc(buffer->heap, GFP_KERNEL);
++	if (entry == NULL) 
++		return -ENOMEM;
++	entry->data = kvzalloc(end - beg, GFP_KERNEL);
++	if (entry->data == NULL) {
++		kmem_cache_free(buffer->heap, entry);
++		return -ENOMEM;
++	}
++	entry->beg = beg;
++	entry->end = end;
++	INIT_LIST_HEAD(&entry->list_node);
++
++	*out = entry;
++	return 0;
++}
++
++void zso_write_entry_destroy(struct zso_write_buffer* buffer, struct zso_write_entry *entry)
++{
++	list_del(&entry->list_node);
++	if (entry->data != NULL)
++		kvfree(entry->data);
++	kmem_cache_free(buffer->heap, entry);
++}
++
++int zso_write_buffer_create(struct file* file, struct zso_write_buffer** out)
++{
++	struct zso_write_buffer* buffer;
++	buffer = kzalloc(sizeof(struct zso_write_buffer), GFP_KERNEL);
++	if (buffer == NULL) {
++		return -ENOMEM;
++	}
++	buffer->heap = kmem_cache_create("zso_write_entries", sizeof(struct zso_write_entry), 0, 0, NULL);
++	if (buffer->heap == NULL) {	
++		kfree(buffer);
++		return -ENOMEM;
++	}
++	INIT_LIST_HEAD(&buffer->entries);
++	mutex_init(&buffer->mutex);
++	// file_size cannot be initialized yet (no inode)
++	*out = buffer;
++	return 0;
++}
++
++void zso_write_buffer_destroy(struct zso_write_buffer* buffer) 
++{
++	struct zso_write_entry *entry, *tmp;
++	list_for_each_entry_safe(entry, tmp, &buffer->entries, list_node) {
++		zso_write_entry_destroy(buffer, entry);
++	}
++	mutex_destroy(&buffer->mutex);
++	kmem_cache_destroy(buffer->heap);
++	kfree(buffer);
++	return;
++}
++
++int zso_buffered_fsync(struct file* file)
++{
++	struct zso_write_entry *entry, *tmp;
++	ssize_t status;
++	loff_t pos;
++
++	if (0 != mutex_lock_interruptible(&file->f_opt_wbuf->mutex))
++		return -ERESTARTSYS;
++		
++	list_for_each_entry_safe(entry, tmp, &file->f_opt_wbuf->entries, list_node) {
++		pos = entry->beg;
++		status = __kernel_write(file, entry->data, entry->end - entry->beg, &pos);
++		if (IS_ERR_VALUE(status))
++			goto out;
++		if (status < entry->end - entry->beg) {
++			status = -ENOSPC;
++			goto out;
++		}
++		zso_write_entry_destroy(file->f_opt_wbuf, entry);
++	}
++
++	status = 0;
++
++out:
++	mutex_unlock(&file->f_opt_wbuf->mutex);
++	return status;
++}
++
++int zso_buffered_truncate(struct file *file, loff_t new_end)
++{
++	struct zso_write_buffer *buffer = file->f_opt_wbuf;
++	struct zso_write_entry *entry = NULL, *tmp;
++	mm_segment_t old_fs;
++	ssize_t status = 0;
++
++	if (0 != mutex_lock_interruptible(&buffer->mutex))
++		return -ERESTARTSYS;
++
++	// Extending case:
++
++	// man ftruncate: 
++	// If the file previously was shorter, it is extended, 
++	// and the extended part reads as null bytes ('\0').
++	if (buffer->file_size < new_end) {
++		char *zeros = kvzalloc(new_end - buffer->file_size, GFP_KERNEL);
++		if (zeros == NULL)
++			goto out;
++		old_fs = get_fs();
++		set_fs(KERNEL_DS);
++		status = zso_buffered_write_locked(file, (__force const char __user *)zeros, new_end - buffer->file_size, &buffer->file_size);
++		status = (status < 0) ? status : 0; // only -ENOMEM can happen here
++		set_fs(old_fs);
++		kvfree(zeros);
++		goto out;
++	}
++
++	// Shrink case:
++
++	// Nothing to do, just modify file_size.
++	if (list_empty(&buffer->entries))
++		goto out;
++
++	// Find first entry that should stay
++	list_for_each_entry_reverse(entry, &buffer->entries, list_node)
++		if (entry->end <= new_end)
++			break;
++
++	// Case: all should stay
++	if (entry->list_node.next == &buffer->entries) 
++		goto out;
++	
++	// Get the first one that should be removed / truncated.
++	// Note: this cannot be head, because of the previous fastpath.
++	entry = list_entry(entry->list_node.next, struct zso_write_entry, list_node);
++
++	// Need to truncate entry:
++	if (entry->beg < new_end) {
++		char* data = kvmalloc(new_end - entry->beg, GFP_KERNEL);
++		if (data == NULL) {
++			status = -ENOMEM;
++			goto out;
++		}
++		memcpy(data, entry->data, new_end - entry->beg);
++		kvfree(entry->data);
++		entry->data = data;
++		entry->end = new_end;
++		// Get the next entry, aka the first to remove, may be head.
++		entry = list_entry(entry->list_node.next, struct zso_write_entry, list_node);
++	}
++
++	// Remove all entries past file_size
++	list_for_each_entry_safe_from(entry, tmp, &buffer->entries, list_node)
++		zso_write_entry_destroy(buffer, entry);
++
++out:
++	buffer->file_size = new_end;
++	mutex_unlock(&buffer->mutex);
++	return status;
++}
++
++ssize_t zso_buffered_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
++{
++	ssize_t status;
++	if (0 != mutex_lock_interruptible(&file->f_opt_wbuf->mutex))
++		return -ERESTARTSYS;
++	status = zso_buffered_read_locked(file, buf, count, pos);
++	mutex_unlock(&file->f_opt_wbuf->mutex);
++	return status;
++}
++
++ssize_t zso_buffered_write(struct file *file, const char __user *user_buf, size_t count, loff_t *pos)
++{
++	ssize_t status;
++	if (0 != mutex_lock_interruptible(&file->f_opt_wbuf->mutex))
++		return -ERESTARTSYS;
++	status = zso_buffered_write_locked(file, user_buf, count, pos);
++	mutex_unlock(&file->f_opt_wbuf->mutex);
++	return status;
++}
++
++ssize_t zso_buffered_read_locked(struct file *file, char __user *buf, size_t count, loff_t *pos)
++{
++	struct list_head *head = &file->f_opt_wbuf->entries;
++	struct list_head *iter;
++	struct zso_write_entry *entry;
++	size_t chunk_sz = 0;
++	ssize_t status = 0;
++	loff_t read_beg = *pos;
++	loff_t read_end = min(file->f_opt_wbuf->file_size, *pos + (loff_t) count);
++
++	iter = head->next;
++	while (read_beg < read_end && iter != head) {
++		entry = list_entry(iter, struct zso_write_entry, list_node);
++
++		// read range is before all entries
++		if (read_end < entry->beg)
++			break;
++		
++		// read range is after current entry
++		if (entry->end <= read_beg) {
++			iter = iter->next;
++			continue;
++		}
++
++		// from here: read_beg < entry->end
++
++		if (read_beg < entry->beg) {
++			// read chunk from the file
++			chunk_sz = min(entry->beg, read_end) - read_beg;
++			status = __vfs_read(file, buf + (read_beg - *pos), chunk_sz, &read_beg);
++			if (IS_ERR_VALUE(status)) {
++				goto done;
++			}
++			if (status < chunk_sz) {
++				status = read_beg - *pos;
++				goto done;
++			}
++		}
++		else {
++			// read chunk from the buffer
++			BUG_ON(!(entry->beg <= read_beg && read_beg < entry->end));
++			chunk_sz = min(entry->end, read_end) - read_beg;
++			if (copy_to_user(buf + (read_beg - *pos), entry->data + (read_beg - entry->beg), chunk_sz) > 0) {
++				status = -EFAULT;
++				goto done;
++			}
++			read_beg += chunk_sz;
++		}
++	}
++
++	// read remaining part from the file
++	if (read_beg < read_end) {
++		status = __vfs_read(file, buf + (read_beg - *pos), read_end - read_beg, &read_beg);
++		if (IS_ERR_VALUE(status)) {
++			goto done;
++		}
++		if (status < chunk_sz) {
++			status = read_beg - *pos;
++			goto done;
++		}
++	}
++
++	status = read_beg - *pos;
++
++done:
++	if (status > 0)
++		*pos += status;
++	return status;
++}
++
++ssize_t zso_buffered_write_locked(struct file *file, const char __user *user_buf, size_t count, loff_t *pos)
++{
++	struct zso_write_entry *entry = NULL, *new_entry = NULL, *first = NULL, *last = NULL, *surrounding = NULL;
++	struct list_head *iter = NULL, *tmp = NULL, *end = NULL;
++	size_t prefix_len = 0, suffix_len = 0;
++	ssize_t status = count;
++	loff_t write_end = *pos + count;
++	loff_t write_beg = *pos;
++	loff_t data_pos = 0;
++	loff_t last_entry_end;
++
++	// Find range of entries that are either adjacent or intersecting
++	list_for_each_entry(entry, &file->f_opt_wbuf->entries, list_node) {
++		if (write_end < entry->beg)
++			break;
++
++		if (entry->beg <= write_beg && write_end <= entry->end) {
++			surrounding = entry;
++			break;
++		}
++
++		if (first == NULL && write_beg <= entry->end && entry->end <= write_end) {
++			first = entry;
++			prefix_len = max(0LL, write_beg - entry->beg);
++		}
++
++		if (write_beg <= entry->beg && entry->beg <= write_end) {
++			last = entry;
++			suffix_len = max(0LL, entry->end - write_end);
++		}
++	}
++
++	// The only case that does not require reallocation
++	// write call is inside <surrounding> entry.
++	if (surrounding != NULL) {
++		if (copy_from_user(entry->data + (write_beg - entry->beg), user_buf, count) > 0) {
++			status = -EFAULT;
++			goto cleanup;
++		}
++		goto done;
++	}
++
++	// Allocating cases here:
++	status = zso_write_entry_create(&new_entry, file->f_opt_wbuf,
++		(prefix_len > 0) ? first->beg : write_beg,
++		(suffix_len > 0) ? last->end : write_end);
++
++	if (IS_ERR_VALUE(status))
++		goto cleanup;
++
++	BUG_ON((new_entry->end - new_entry->beg) != prefix_len + count + suffix_len);
++
++	// Copy from prefix entry
++	if (prefix_len > 0) {
++		memcpy(new_entry->data + data_pos, first->data, prefix_len);
++		data_pos += prefix_len;
++	}
++
++	// Actual copy from user
++	if (copy_from_user(new_entry->data + data_pos, user_buf, count) > 0) {
++		status = -EFAULT;
++		goto cleanup;
++	}
++	data_pos += count;
++
++	// Copy from suffix entry
++	if (suffix_len > 0) {
++		memcpy(new_entry->data + data_pos, last->data + (write_end - last->beg), suffix_len);
++		data_pos += count;
++	}
++
++	// Remove unused entries (between first, last inclusive).
++	if (first != NULL || last != NULL) {
++		iter = (first != NULL) ? &first->list_node : &last->list_node;
++		end = (last != NULL) ? last->list_node.next : first->list_node.next;
++		for (tmp = iter->next; iter != end; iter = tmp, tmp = iter->next) {
++			entry = list_entry(iter, struct zso_write_entry, list_node);
++			zso_write_entry_destroy(file->f_opt_wbuf, entry);
++		}
++	} 
++
++	// Add the new_entry:
++	iter = &file->f_opt_wbuf->entries;
++	if (!list_empty(&file->f_opt_wbuf->entries)) {
++		list_for_each(iter, &file->f_opt_wbuf->entries) {
++			entry = list_entry(iter, struct zso_write_entry, list_node);
++			if (new_entry->beg < entry->beg) {
++				break;
++			}
++		}
++	}
++	list_add(&new_entry->list_node, iter->prev);
++
++done:
++	// Update file_size and *pos
++	last_entry_end = list_entry(file->f_opt_wbuf->entries.prev, struct zso_write_entry, list_node)->end;
++	file->f_opt_wbuf->file_size = max(file->f_opt_wbuf->file_size, last_entry_end);
++	*pos += count;
++	return count;
++
++cleanup:
++	if (new_entry != NULL)
++		zso_write_entry_destroy(file->f_opt_wbuf, new_entry);
++	return status;
++}
+diff --git a/include/linux/fcntl.h b/include/linux/fcntl.h
+index d019df946..33e9a491a 100644
+--- a/include/linux/fcntl.h
++++ b/include/linux/fcntl.h
+@@ -9,7 +9,7 @@
+ 	(O_RDONLY | O_WRONLY | O_RDWR | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | \
+ 	 O_APPEND | O_NDELAY | O_NONBLOCK | O_NDELAY | __O_SYNC | O_DSYNC | \
+ 	 FASYNC	| O_DIRECT | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | \
+-	 O_NOATIME | O_CLOEXEC | O_PATH | __O_TMPFILE)
++	 O_NOATIME | O_CLOEXEC | O_PATH | __O_TMPFILE | O_BUFFERED_WRITE)
+ 
+ #ifndef force_o_largefile
+ #define force_o_largefile() (!IS_ENABLED(CONFIG_ARCH_32BIT_OFF_T))
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 98e0349ad..243cc72f1 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -932,6 +932,32 @@ static inline int ra_has_index(struct file_ra_state *ra, pgoff_t index)
+ 		index <  ra->start + ra->size);
+ }
+ 
++// Represents continuous area written by user.
++struct zso_write_entry {
++	char* data;  // allocated with kvmalloc
++	loff_t beg;  // offsets from the file beginning
++	loff_t end;
++	struct list_head list_node;
++};
++
++struct zso_write_buffer {
++	struct kmem_cache* heap;   // struct zso_write_entry
++	struct list_head entries;  // struct zso_write_entry
++	struct mutex mutex;  // guards all members of this struct
++	loff_t file_size;
++};
++
++int zso_write_entry_create(struct zso_write_entry **out, struct zso_write_buffer*, loff_t beg, loff_t end);
++void zso_write_entry_destroy(struct zso_write_buffer*, struct zso_write_entry*);
++int zso_write_buffer_create(struct file *file, struct zso_write_buffer**);
++void zso_write_buffer_destroy(struct zso_write_buffer*);
++
++int zso_buffered_fsync(struct file* file);
++int zso_buffered_truncate(struct file *file, loff_t new_end);
++ssize_t zso_buffered_read(struct file *file, char __user *buf, size_t count, loff_t *pos);
++ssize_t zso_buffered_read_locked(struct file *file, char __user *buf, size_t count, loff_t *pos);
++ssize_t zso_buffered_write(struct file *file, const char __user *user_buf, size_t count, loff_t *pos);
++ssize_t zso_buffered_write_locked(struct file *file, const char __user *user_buf, size_t count, loff_t *pos);
+ struct file {
+ 	union {
+ 		struct llist_node	fu_llist;
+@@ -940,6 +966,8 @@ struct file {
+ 	struct path		f_path;
+ 	struct inode		*f_inode;	/* cached value */
+ 	const struct file_operations	*f_op;
++	
++	struct zso_write_buffer *f_opt_wbuf;
+ 
+ 	/*
+ 	 * Protects f_ep_links, f_flags.
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 5262b7a76..f86d7a382 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1353,11 +1353,11 @@ static inline long ksys_lchown(const char __user *filename, uid_t user,
+ 			     AT_SYMLINK_NOFOLLOW);
+ }
+ 
+-extern long do_sys_ftruncate(unsigned int fd, loff_t length, int small);
++extern long do_sys_ftruncate(unsigned int fd, loff_t length, int small, bool omit_buffering);
+ 
+ static inline long ksys_ftruncate(unsigned int fd, unsigned long length)
+ {
+-	return do_sys_ftruncate(fd, length, 1);
++	return do_sys_ftruncate(fd, length, 1, false);
+ }
+ 
+ extern int __close_fd(struct files_struct *files, unsigned int fd);
+diff --git a/include/uapi/asm-generic/fcntl.h b/include/uapi/asm-generic/fcntl.h
+index 9dc0bf0c5..c187032ae 100644
+--- a/include/uapi/asm-generic/fcntl.h
++++ b/include/uapi/asm-generic/fcntl.h
+@@ -89,6 +89,11 @@
+ #define __O_TMPFILE	020000000
+ #endif
+ 
++#ifndef O_BUFFERED_WRITE
++#define O_BUFFERED_WRITE 040000000	/* buffer user writes */
++#endif
++
++
+ /* a horrid kludge trying to make sure that this will fail on old kernels */
+ #define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
+ #define O_TMPFILE_MASK (__O_TMPFILE | O_DIRECTORY | O_CREAT)      
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 71e4ffc83..f766482e9 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1568,6 +1568,8 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
+ 		file = fget(fd);
+ 		if (!file)
+ 			return -EBADF;
++		if (file->f_flags & O_BUFFERED_WRITE)
++			return -EINVAL;
+ 		if (is_file_hugepages(file))
+ 			len = ALIGN(len, huge_page_size(hstate_file(file)));
+ 		retval = -EINVAL;
+-- 
+2.17.1
+

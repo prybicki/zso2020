@@ -1,0 +1,80 @@
+[   14.313214] ======================================================
+[   14.314995] WARNING: possible circular locking dependency detected
+[   14.316738] 5.5.5+ #114 Not tainted
+[   14.317907] ------------------------------------------------------
+[   14.319210] partial_pwrite_/489 is trying to acquire lock:
+[   14.320316] ffff942abb32c410 (sb_writers#10){.+.+}, at: vfs_write+0x15a/0x1c0
+[   14.321574] 
+[   14.321574] but task is already holding lock:
+[   14.323133] ffff942aba679978 (&buffer->mutex){+.+.}, at: zso_buffered_fsync+0x31/0x100
+[   14.324653] 
+[   14.324653] which lock already depends on the new lock.
+[   14.324653] 
+[   14.326999] 
+[   14.326999] the existing dependency chain (in reverse order) is:
+[   14.328826] 
+[   14.328826] -> #1 (&buffer->mutex){+.+.}:
+[   14.330537]        __mutex_lock+0x87/0x8d0
+[   14.332202]        zso_buffered_write+0x26/0x5e
+[   14.334379]        vfs_write+0xb1/0x1c0
+[   14.335361]        ksys_pwrite64+0x64/0xa0
+[   14.336531]        do_syscall_64+0x54/0x220
+[   14.337699]        entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[   14.338932] 
+[   14.338932] -> #0 (sb_writers#10){.+.+}:
+[   14.340511]        __lock_acquire+0xd77/0x1440
+[   14.341478]        lock_acquire+0x90/0x150
+[   14.342459]        __sb_start_write+0x102/0x1d0
+[   14.343495]        vfs_write+0x15a/0x1c0
+[   14.344472]        kernel_write+0x2c/0x40
+[   14.345439]        zso_buffered_fsync+0xa8/0x100
+[   14.346491]        do_fsync+0x80/0xb0
+[   14.347400]        __x64_sys_fsync+0x10/0x20
+[   14.348399]        do_syscall_64+0x54/0x220
+[   14.349428]        entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[   14.350602] 
+[   14.350602] other info that might help us debug this:
+[   14.350602] 
+[   14.352787]  Possible unsafe locking scenario:
+[   14.352787] 
+[   14.354451]        CPU0                    CPU1
+[   14.355494]        ----                    ----
+[   14.356544]   lock(&buffer->mutex);
+[   14.357456]                                lock(sb_writers#10);
+[   14.358682]                                lock(&buffer->mutex);
+[   14.359908]   lock(sb_writers#10);
+[   14.361073] 
+[   14.361073]  *** DEADLOCK ***
+[   14.361073] 
+[   14.365178] 1 lock held by partial_pwrite_/489:
+[   14.366361]  #0: ffff942aba679978 (&buffer->mutex){+.+.}, at: zso_buffered_fsync+0x31/0x100
+[   14.367938] 
+[   14.367938] stack backtrace:
+[   14.369337] CPU: 1 PID: 489 Comm: partial_pwrite_ Not tainted 5.5.5+ #114
+[   14.370563] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1ubuntu1 04/01/2014
+[   14.372021] Call Trace:
+[   14.372744]  dump_stack+0x71/0xa0
+[   14.373650]  check_noncircular+0x172/0x190
+[   14.374628]  __lock_acquire+0xd77/0x1440
+[   14.375566]  lock_acquire+0x90/0x150
+[   14.376465]  ? vfs_write+0x15a/0x1c0
+[   14.377356]  ? zso_buffered_fsync+0x31/0x100
+[   14.378347]  __sb_start_write+0x102/0x1d0
+[   14.379285]  ? vfs_write+0x15a/0x1c0
+[   14.380167]  vfs_write+0x15a/0x1c0
+[   14.381289]  kernel_write+0x2c/0x40
+[   14.382351]  zso_buffered_fsync+0xa8/0x100
+[   14.383476]  do_fsync+0x80/0xb0
+[   14.384466]  __x64_sys_fsync+0x10/0x20
+[   14.385544]  do_syscall_64+0x54/0x220
+[   14.386626]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[   14.387892] RIP: 0033:0x7fc1b48fb214
+[   14.388953] Code: 89 01 48 83 c8 ff c3 66 2e 0f 1f 84 00 00 00 00 00 0f 1f 44 00 00 48 8d 05 e9 f4 0c 00 8b 00 85 c0 75 13 b8 4a 00 00 00 0f 05 <48> 3d 00 f0 ff ff 77 3c c3 0f 1f 00 53 89 fb 48 83 ec 10 e8 24 55
+[   14.393178] RSP: 002b:00007ffd9a1eb298 EFLAGS: 00000246 ORIG_RAX: 000000000000004a
+[   14.395082] RAX: ffffffffffffffda RBX: 0000000000000000 RCX: 00007fc1b48fb214
+[   14.396757] RDX: 0000000000000003 RSI: 000055e22489b080 RDI: 0000000000000003
+[   14.398408] RBP: 00007ffd9a1eb2b0 R08: 00007fc1b49c6d80 R09: 00007fc1b49c6d80
+[   14.400045] R10: fffffffffffff54e R11: 0000000000000246 R12: 000055e2248980e0
+[   14.401690] R13: 00007ffd9a1eb390 R14: 0000000000000000 R15: 0000000000000000
+
+

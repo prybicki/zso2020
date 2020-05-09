@@ -1,0 +1,108 @@
+write tests:
+
+# Write inside, single char
+l 4
+w a
+l 4
+w b
+===
+[4,5)=b
+===
+
+# Add on the right
+l 4
+w a
+l 6
+w b
+===
+[4,5)=a
+[6,7)=b
+
+# Add on the left
+l 4
+w a
+l 2
+w b
+===
+[2,3)=b
+[4,5)=a
+
+# Merge with prefix partial [first]
+l 4
+w 4567
+l 6
+w yyyy
+===
+[4,10)=45yyyy
+===
+
+# Merge with prefix full [first]
+l 4
+w 4567
+l 8
+w 89
+===
+[4,10)=456789
+===
+
+# Merge with empty prefix [first == last]
+l 4
+w 4567
+l 4
+w 456789
+===
+[4,10)=456789
+===
+
+# Same for suffixes
+
+# Merge with suffix partial [last]
+l 4
+w 4567
+l 2
+w yyyy
+===
+[2,8)=yyyy67
+===
+
+# Merge with suffix full [last]
+l 4
+w 4567
+l 2
+w 23
+===
+[2,8)=234567
+===
+
+# Merge with empty suffix [first == last]
+l 4
+w 4567
+l 2
+w 234567
+===
+[2,8)=234567
+===
+
+# Merge with 1 inside [first == last]
+l 2
+w yy
+l 0
+w 012345
+===
+[0,6)=012345
+===
+
+# Merge with many inside [first != last]
+l 2
+w yy
+l 6
+w zz
+l 0
+w 0123456789
+===
+[0,10)=0123456789
+===
+
+
+
+
