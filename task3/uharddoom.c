@@ -8,6 +8,12 @@
 #include <linux/cdev.h>
 
 #include "uharddoom.h"
+#include "udoomfw.h"
+
+// QUESTION Co znaczy że urządzenie obsługuje 32 bitowe wirtualne i 40 bitowe fizyczne?
+// QUESTION Czy potrzebujemy używać jakichś mem-fence podczas startu urządzenia?
+//          Np. po wgraniu firmware.
+
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -15,6 +21,9 @@
 
 #define dbg(fmt, ...) printk(KERN_NOTICE "uharddoom: [%d] " fmt, __LINE__, ##__VA_ARGS__)
 #define cry(fn, value) dbg("%s(...) failed with %d\n", #fn, value)
+
+#define W(reg, data) iowrite32(data, (void*) (((char*) device->iomem) + reg))
+#define R(reg) ioread32((void*) (((char*) device->iomem) + reg))
 
 int drv_initialize(void);
 void drv_terminate(void);
@@ -33,6 +42,7 @@ int dev_init_pci(struct DeviceCtx* device);
 int dev_init_dma(struct DeviceCtx* device);
 int dev_init_hardware(struct DeviceCtx* device);
 int dev_init_chardev(struct DeviceCtx* device);
+irqreturn_t dev_handle_irq(int irq, void* dev);
 
 int  file_open(struct inode *, struct file *);
 long file_unlocked_ioctl(struct file *, unsigned int, unsigned long);
@@ -55,6 +65,9 @@ struct DeviceCtx {
 	bool pci_request_regions_done;
 	// pci_iomap_done == iomem;
 
+	bool pci_set_master_done;
+
+
 	bool cdev_add_done;
 	// device_create_done == sysfs;
 };
@@ -72,7 +85,7 @@ const struct pci_device_id known_devices[] = {
 
 // TODO: Does it matter? How?
 struct class device_class = {
-	.name = "uharddoomclass",
+	.name = "uharddoom",
 	.owner = THIS_MODULE,
 };
 
@@ -98,11 +111,11 @@ struct file_operations file_api = {
 ///////////////////////////////////////////////////////////////////////////////
 // Globals
 
-dev_t dev_major;
+dev_t devt_base;
 bool pci_register_driver_done;
 bool class_register_done;
 
-struct mutex devices_mutex;
+DEFINE_MUTEX(devices_mutex);
 struct DeviceCtx* devices[MAX_DEVICE_COUNT];
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -114,11 +127,12 @@ int drv_initialize(void)
 
 	dbg("initialization started, build %s %s\n", __DATE__, __TIME__);
 
-	error = alloc_chrdev_region(&dev_major, 0, MAX_DEVICE_COUNT, DRIVER_NAME);
+	error = alloc_chrdev_region(&devt_base, 0, MAX_DEVICE_COUNT, DRIVER_NAME);
 	if (error) {
 		cry(alloc_chrdev_region, error);
 		goto failed;
 	}
+	dbg("got devt_base: %d %d\n", MAJOR(devt_base), MINOR(devt_base));
 
 	error = class_register(&device_class);
 	if (error) {
@@ -144,6 +158,7 @@ failed:
 	return error;
 }
 
+// TODO
 void drv_terminate(void)
 {
 	dbg("termination started\n");
@@ -158,9 +173,9 @@ void drv_terminate(void)
 	// 	class_register_done = false;
 	// }
 
-	// if (dev_major) {
-	// 	unregister_chrdev_region(dev_major, MAX_DEVICE_COUNT);
-	// 	dev_major = 0;
+	// if (devt_base) {
+	// 	unregister_chrdev_region(devt_base, MAX_DEVICE_COUNT);
+	// 	devt_base = 0;
 	// }
 
 	dbg("termination done\n");
@@ -224,7 +239,7 @@ int dev_init_pci(struct DeviceCtx* device)
 	device->pci_enable_device_done = true;
 
 	error = pci_request_regions(device->pci_dev, DRIVER_NAME);
-	if (error) {
+	if (error) {	
 		cry(pci_request_regions, error);
 		goto out;
 	}
@@ -243,24 +258,73 @@ out:
 	return error;
 }
 
+// TODO unfinished
+int dev_init_dma(struct DeviceCtx* device)
+{
+	int error = 0;
+
+	// TODO: co to dokładnie robi? czy trzeba to cofać?
+	pci_set_master(device->pci_dev);
+	device->pci_set_master_done = true;
+
+	// TODO czy tu jest potrzebny cleanup?
+	error = pci_set_dma_mask(device->pci_dev, DMA_BIT_MASK(32));
+	if (error) {
+		cry(pci_set_dma_mask, error);
+		goto out;
+	}
+	
+	error = pci_set_consistent_dma_mask(device->pci_dev, DMA_BIT_MASK(32));
+	if (error) {
+		cry(pci_set_consistent_dma_mask, error);
+		goto out;
+	}
+
+out:
+	return error;
+}
+
+int dev_init_hardware(struct DeviceCtx* device)
+{
+	size_t i;
+	// zapisać 0 do FE_CODE_ADDR,
+	W(UHARDDOOM_FE_CODE_ADDR, 0);
+	// kolejno zapisać wszystkie słowa tablicy udoomfw[] do FE_CODE_WINDOW,
+	for (i = 0; i < ARRAY_SIZE(udoomfw); ++i) {
+		W(UHARDDOOM_FE_CODE_WINDOW, udoomfw[i]);
+	}
+	// zresetować wszystkie bloki urządzenia przez zapis 0x7f7ffffe do RESET,
+	W(UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
+	// zainicjować BATCH_PDP, BATCH_GET, BATCH_PUT i BATCH_WRAP, jeśli chcemy użyć bloku wczytywania pleceń,
+	(void) 0;
+	// wyzerować INTR przez zapis 0xff33,
+	W(UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
+	// włączyć używane przez nas przerwania w INTR_ENABLE,
+	W(UHARDDOOM_INTR_ENABLE, (UHARDDOOM_INTR_MASK & (~UHARDDOOM_INTR_BATCH_WAIT)));
+	// włączyć wszystkie bloki urządzenia w ENABLE (być może z wyjątkiem BATCH).
+	W(UHARDDOOM_ENABLE, (UHARDDOOM_ENABLE_ALL & (~UHARDDOOM_ENABLE_BATCH)));
+
+	return 0;
+}
+
 int dev_init_chardev(struct DeviceCtx* device)
 {
 	struct device* sysfs = NULL;
-	dev_t dev_idx = 0;
+	dev_t devt = 0;
 	int error = 0;
 
-	dev_idx = MKDEV(dev_major, device->index),
+	devt = MKDEV(MAJOR(devt_base), device->index),
 	cdev_init(&device->cdev, &file_api);
 	device->cdev.owner = THIS_MODULE;
 
-	error = cdev_add(&device->cdev, dev_idx, 1);
+	error = cdev_add(&device->cdev, devt, 1);
 	if (error) {
 		cry(cdev_add, error);
 		goto out;
 	}
 	device->cdev_add_done = true;
 
-	sysfs = device_create(&device_class, &device->pci_dev->dev, dev_idx, NULL, "udoom%zd", device->index);
+	sysfs = device_create(&device_class, &device->pci_dev->dev, devt, NULL, "udoom%zd", device->index);
 	if (IS_ERR(sysfs)) {
 		error = PTR_ERR(sysfs);
 		cry(device_create, error);
@@ -268,8 +332,19 @@ int dev_init_chardev(struct DeviceCtx* device)
 	}
 	device->sysfs = sysfs;
 
+	dbg("device registered: %d %d", MAJOR(devt), MINOR(devt));
 out:
 	return error;
+}
+
+// TODO
+irqreturn_t dev_handle_irq(int irq, void* dev)
+{
+	struct DeviceCtx* device = (struct DeviceCtx*) dev;
+
+	dbg("haha interrupt %d\n", irq);
+	return IRQ_HANDLED;
+	// TODO
 }
 
 // Always called from process context, so it can sleep.
@@ -303,10 +378,24 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 		goto fail;
 	}
 
+	// Documentation/PCI/pci.rst
+	// Make sure the device is quiesced and does not have any 
+	// interrupts pending before registering the interrupt handler.
+	error = request_irq(device->pci_dev->irq, dev_handle_irq, IRQF_SHARED, DRIVER_NAME, device);
+	if (error) {
+		cry(request_irq, error);
+		goto fail;
+	}
+
+	error = dev_init_chardev(device);
+	if (error) {
+		goto fail;
+	}
+
 	dbg("probe done [%zd]\n", device->index);
 
 fail:
-	// TODO!
+	// TODO cleanup!
 	return error;
 }
 
