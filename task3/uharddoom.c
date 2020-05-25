@@ -9,6 +9,7 @@
 
 #include "uharddoom.h"
 #include "udoomfw.h"
+#include "udoomdev.h"
 
 // QUESTION Co znaczy że urządzenie obsługuje 32 bitowe wirtualne i 40 bitowe fizyczne?
 // QUESTION Czy potrzebujemy używać jakichś mem-fence podczas startu urządzenia?
@@ -40,9 +41,12 @@ struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev);
 void dev_free(struct DeviceCtx* device);
 int dev_init_pci(struct DeviceCtx* device);
 int dev_init_dma(struct DeviceCtx* device);
+int dev_init_irq(struct DeviceCtx* device);
 int dev_init_hardware(struct DeviceCtx* device);
 int dev_init_chardev(struct DeviceCtx* device);
 irqreturn_t dev_handle_irq(int irq, void* dev);
+
+void dev_printk_status(struct DeviceCtx* device);
 
 int  file_open(struct inode *, struct file *);
 long file_unlocked_ioctl(struct file *, unsigned int, unsigned long);
@@ -55,7 +59,7 @@ int  file_release(struct inode *, struct file *);
 // Structs
 
 struct DeviceCtx {
-	struct cdev cdev;
+	struct cdev* cdev;
 	struct device* sysfs;
 	struct pci_dev* pci_dev;
 	void __iomem* iomem;
@@ -63,12 +67,10 @@ struct DeviceCtx {
 
 	bool pci_enable_device_done;
 	bool pci_request_regions_done;
-	// pci_iomap_done == iomem;
-
 	bool pci_set_master_done;
-
-
+	bool request_irq_done;
 	bool cdev_add_done;
+	// pci_iomap_done == iomem;
 	// device_create_done == sysfs;
 };
 
@@ -115,6 +117,7 @@ dev_t devt_base;
 bool pci_register_driver_done;
 bool class_register_done;
 
+atomic_t deinitializing;
 DEFINE_MUTEX(devices_mutex);
 struct DeviceCtx* devices[MAX_DEVICE_COUNT];
 
@@ -150,7 +153,6 @@ int drv_initialize(void)
 	pci_register_driver_done = true;
 
 	dbg("initialization done\n");
-	BUG_ON(error);
 	return error;
 
 failed:
@@ -161,24 +163,24 @@ failed:
 // TODO
 void drv_terminate(void)
 {
-	dbg("termination started\n");
+	dbg("driver termination started\n");
 
-	// if (pci_register_driver_done) {
-	// 	pci_unregister_driver(&driver_api);
-	// 	pci_register_driver_done = false;
-	// }
+	if (pci_register_driver_done) {
+		pci_unregister_driver(&driver_api);
+		pci_register_driver_done = false;
+	}
 
-	// if (class_register_done) {
-	// 	class_unregister(&device_class);
-	// 	class_register_done = false;
-	// }
+	if (class_register_done) {
+		class_unregister(&device_class);
+		class_register_done = false;
+	}
 
-	// if (devt_base) {
-	// 	unregister_chrdev_region(devt_base, MAX_DEVICE_COUNT);
-	// 	devt_base = 0;
-	// }
+	if (devt_base) {
+		unregister_chrdev_region(devt_base, MAX_DEVICE_COUNT);
+		devt_base = 0;
+	}
 
-	dbg("termination done\n");
+	dbg("driver termination done\n");
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -211,6 +213,7 @@ struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev)
 	devices[idx] = status;
 	devices[idx]->index = idx;
 	devices[idx]->pci_dev = pci_dev;
+	pci_set_drvdata(pci_dev, devices[idx]);
 out:
 	mutex_unlock(&devices_mutex);
 	return status;
@@ -309,22 +312,31 @@ int dev_init_hardware(struct DeviceCtx* device)
 
 int dev_init_chardev(struct DeviceCtx* device)
 {
+	struct device* parent_dev = NULL;
 	struct device* sysfs = NULL;
-	dev_t devt = 0;
+	struct cdev* cdev = NULL;
+	dev_t devt = devt_base + device->index;
 	int error = 0;
 
-	devt = MKDEV(MAJOR(devt_base), device->index),
-	cdev_init(&device->cdev, &file_api);
-	device->cdev.owner = THIS_MODULE;
+	cdev = cdev_alloc();
+	if (IS_ERR(cdev)) {
+		error = PTR_ERR(cdev);
+		cry(cdev_alloc, error);
+		goto out;
+	}
+	cdev->ops = &file_api;
+	cdev->owner = THIS_MODULE;
+	device->cdev = cdev;
 
-	error = cdev_add(&device->cdev, devt, 1);
+	error = cdev_add(device->cdev, devt, 1);
 	if (error) {
 		cry(cdev_add, error);
 		goto out;
 	}
 	device->cdev_add_done = true;
 
-	sysfs = device_create(&device_class, &device->pci_dev->dev, devt, NULL, "udoom%zd", device->index);
+	parent_dev = &device->pci_dev->dev;
+	sysfs = device_create(&device_class, parent_dev, devt, NULL, "udoom%zd", device->index);
 	if (IS_ERR(sysfs)) {
 		error = PTR_ERR(sysfs);
 		cry(device_create, error);
@@ -333,6 +345,21 @@ int dev_init_chardev(struct DeviceCtx* device)
 	device->sysfs = sysfs;
 
 	dbg("device registered: %d %d", MAJOR(devt), MINOR(devt));
+out:
+	return error;
+}
+
+int dev_init_irq(struct DeviceCtx* device)
+{
+	int error = 0;
+
+	error = request_irq(device->pci_dev->irq, dev_handle_irq, IRQF_SHARED, DRIVER_NAME, device);
+	if (error) {
+		cry(request_irq, error);
+		goto out;
+	}
+	device->request_irq_done = true;
+
 out:
 	return error;
 }
@@ -353,7 +380,7 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 	struct DeviceCtx* device = NULL;
 	int error = 0;
 	
-	dbg("probe started\n");
+	dbg("device probe started\n");
 
 	device = dev_alloc(pci_dev);
 	if (IS_ERR(device)) {
@@ -381,9 +408,8 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 	// Documentation/PCI/pci.rst
 	// Make sure the device is quiesced and does not have any 
 	// interrupts pending before registering the interrupt handler.
-	error = request_irq(device->pci_dev->irq, dev_handle_irq, IRQF_SHARED, DRIVER_NAME, device);
+	error = dev_init_irq(device);
 	if (error) {
-		cry(request_irq, error);
 		goto fail;
 	}
 
@@ -392,18 +418,75 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 		goto fail;
 	}
 
-	dbg("probe done [%zd]\n", device->index);
+	dbg("device probe done [%zd]\n", device->index);
+
+
+	dev_printk_status(device);
+	return 0;
 
 fail:
-	// TODO cleanup!
+	dev_remove(pci_dev);
 	return error;
 }
 
 
+// TODO unfinished, free resources
 void dev_remove(struct pci_dev *dev)
 {
-	// cdev_del
-	// device_destroy
+	struct DeviceCtx* device = pci_get_drvdata(dev);
+	BUG_ON(device == NULL);
+
+	// TODO finish tasks..
+	// Think of some locking here
+	// TODO ORDERING MAY BE WRONG!!!
+	// Especially IRQ/DMA
+
+	dbg("device removal started\n");
+
+	if (device->sysfs) {
+		device_destroy(&device_class, devt_base + device->index);
+		device->sysfs = NULL;
+	}
+
+	if (device->cdev) {
+		cdev_del(device->cdev);
+		device->cdev = NULL;
+	}
+
+	// DMA
+	if (device->pci_set_master_done) {
+		pci_clear_master(dev);
+		device->pci_set_master_done = false;
+	}
+
+	// IRQ
+	if (device->request_irq_done) {
+		free_irq(dev->irq, device);
+		device->request_irq_done = false;
+	}
+
+	if (device->iomem) {
+		pci_iounmap(dev, device->iomem);
+		device->iomem = NULL;
+	}
+
+	if (device->pci_request_regions_done) {
+		pci_release_regions(dev);
+		device->pci_request_regions_done = false;
+	}
+
+	if (device->pci_enable_device_done) {
+		pci_disable_device(dev);
+		device->pci_enable_device_done = false;
+	}
+
+	mutex_lock(&devices_mutex);
+	devices[device->index] = NULL;
+	mutex_unlock(&devices_mutex);
+	pci_set_drvdata(device->pci_dev, NULL);
+	kfree(device);
+
+	dbg("device removal done\n");
 }
 
 int dev_suspend(struct pci_dev *dev, pm_message_t state)
@@ -455,3 +538,67 @@ int file_release(struct inode *inode, struct file *file)
 MODULE_LICENSE("GPL");
 module_init(drv_initialize);
 module_exit(drv_terminate);
+
+///////////////////////////////////////////////////////////////////////////////
+// Debug
+
+void dev_printk_status(struct DeviceCtx* device)
+{
+	static uint32_t stats[UHARDDOOM_STATS_NUM];
+	uint32_t status;
+	size_t idx;
+
+	dbg("reading state..\n");
+
+	status = R(UHARDDOOM_STATUS);
+	for (idx = 0; idx < UHARDDOOM_STATS_NUM; ++idx) {
+		stats[idx] = R(UHARDDOOM_STATS(idx));
+	}
+
+	dbg("UHARDDOOM_STATUS_BATCH: %u\n", (status & UHARDDOOM_STATUS_BATCH));
+	dbg("UHARDDOOM_STATUS_JOB: %u\n", (status & UHARDDOOM_STATUS_JOB));
+	dbg("UHARDDOOM_STATUS_CMD: %u\n", (status & UHARDDOOM_STATUS_CMD));
+	dbg("UHARDDOOM_STATUS_FE: %u\n", (status & UHARDDOOM_STATUS_FE));
+	dbg("UHARDDOOM_STATUS_SRD: %u\n", (status & UHARDDOOM_STATUS_SRD));
+	dbg("UHARDDOOM_STATUS_SPAN: %u\n", (status & UHARDDOOM_STATUS_SPAN));
+	dbg("UHARDDOOM_STATUS_COL: %u\n", (status & UHARDDOOM_STATUS_COL));
+	dbg("UHARDDOOM_STATUS_FX: %u\n", (status & UHARDDOOM_STATUS_FX));
+	dbg("UHARDDOOM_STATUS_SWR: %u\n", (status & UHARDDOOM_STATUS_SWR));
+	dbg("UHARDDOOM_STATUS_FIFO_SRDCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDCMD));
+	dbg("UHARDDOOM_STATUS_FIFO_SPANCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANCMD));
+	dbg("UHARDDOOM_STATUS_FIFO_COLCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLCMD));
+	dbg("UHARDDOOM_STATUS_FIFO_FXCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXCMD));
+	dbg("UHARDDOOM_STATUS_FIFO_SWRCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SWRCMD));
+	dbg("UHARDDOOM_STATUS_FIFO_COLIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLIN));
+	dbg("UHARDDOOM_STATUS_FIFO_FXIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXIN));
+	dbg("UHARDDOOM_STATUS_FIFO_FESEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_FESEM));
+	dbg("UHARDDOOM_STATUS_FIFO_SRDSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDSEM));
+	dbg("UHARDDOOM_STATUS_FIFO_COLSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLSEM));
+	dbg("UHARDDOOM_STATUS_FIFO_SPANSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANSEM));
+	dbg("UHARDDOOM_STATUS_FIFO_SPANOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANOUT));
+	dbg("UHARDDOOM_STATUS_FIFO_COLOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLOUT));
+	dbg("UHARDDOOM_STATUS_FIFO_FXOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXOUT));
+
+	dbg("UHARDDOOM_STAT_FW_JOB: %u\n", stats[0x00]);
+	dbg("UHARDDOOM_STAT_FW_CMD: %u\n", stats[0x01]);
+	dbg("UHARDDOOM_STAT_CMD_BLOCK: %u\n", stats[0x56]);
+	dbg("UHARDDOOM_STAT_CMD_WORD: %u\n", stats[0x57]);
+	dbg("UHARDDOOM_STAT_FE_INSN: %u\n", stats[0x58]);
+	dbg("UHARDDOOM_STAT_FE_LOAD: %u\n", stats[0x59]);
+	dbg("UHARDDOOM_STAT_FE_STORE: %u\n", stats[0x5a]);
+	dbg("UHARDDOOM_STAT_MMIO_READ: %u\n", stats[0x5c]);
+	dbg("UHARDDOOM_STAT_MMIO_WRITE: %u\n", stats[0x5d]);
+	dbg("UHARDDOOM_STAT_SRD_CMD: %u\n", stats[0x60]);
+	dbg("UHARDDOOM_STAT_SRD_READ: %u\n", stats[0x61]);
+	dbg("UHARDDOOM_STAT_SRD_BLOCK: %u\n", stats[0x62]);
+	dbg("UHARDDOOM_STAT_SRD_FESEM: %u\n", stats[0x63]);
+	dbg("UHARDDOOM_STAT_SWR_CMD: %u\n", stats[0x78]);
+	dbg("UHARDDOOM_STAT_SWR_DRAW: %u\n", stats[0x79]);
+	dbg("UHARDDOOM_STAT_SWR_BLOCK: %u\n", stats[0x7a]);
+	dbg("UHARDDOOM_STAT_SWR_BLOCK_READ: %u\n", stats[0x7b]);
+	dbg("UHARDDOOM_STAT_SWR_BLOCK_TRANS: %u\n", stats[0x7c]);
+	dbg("UHARDDOOM_STAT_SWR_SRDSEM: %u\n", stats[0x7d]);
+	dbg("UHARDDOOM_STAT_SWR_COLSEM: %u\n", stats[0x7e]);
+	dbg("UHARDDOOM_STAT_SWR_SPANSEM: %u\n", stats[0x7f]);
+
+}
