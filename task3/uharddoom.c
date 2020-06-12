@@ -15,7 +15,32 @@
 // QUESTION Czy potrzebujemy używać jakichś mem-fence podczas startu urządzenia?
 //          Np. po wgraniu firmware.
 
+///////////////////////////////////////////////////////////////////////////////
+// Structs
 
+struct DeviceCtx {
+	size_t index;
+	struct list_head users;
+
+	struct cdev cdev;
+	struct device* sysfs;
+	struct pci_dev* pci_dev;
+	void __iomem* iomem;
+	
+
+	bool pci_enable_device_done;
+	bool pci_request_regions_done;
+	bool pci_set_master_done;
+	bool request_irq_done;
+	bool cdev_add_done;
+	// pci_iomap_done == iomem;
+	// device_create_done == sysfs;
+};
+
+struct UserCtx {
+	struct DeviceCtx* device;
+	struct list_head list_node;
+};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Callable
@@ -48,31 +73,16 @@ irqreturn_t dev_handle_irq(int irq, void* dev);
 
 void dev_printk_status(struct DeviceCtx* device);
 
-int  file_open(struct inode *, struct file *);
-long file_unlocked_ioctl(struct file *, unsigned int, unsigned long);
-long file_compat_ioctl(struct file *, unsigned int, unsigned long);
-int  file_mmap(struct file *, struct vm_area_struct *);
-int  file_release(struct inode *, struct file *);
+int  chardev_open(struct inode *, struct file *);
+long chardev_ioctl(struct file *, unsigned int, unsigned long);
+int  chardev_release(struct inode *, struct file *);
 
-
-///////////////////////////////////////////////////////////////////////////////
-// Structs
-
-struct DeviceCtx {
-	struct cdev* cdev;
-	struct device* sysfs;
-	struct pci_dev* pci_dev;
-	void __iomem* iomem;
-	size_t index;
-
-	bool pci_enable_device_done;
-	bool pci_request_regions_done;
-	bool pci_set_master_done;
-	bool request_irq_done;
-	bool cdev_add_done;
-	// pci_iomap_done == iomem;
-	// device_create_done == sysfs;
-};
+// IOCTLs
+long do_create_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_create_buffer *cmd);
+long do_map_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_map_buffer *cmd);
+long do_unmap_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_unmap_buffer *cmd);
+long do_run(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_run *cmd);
+long do_wait(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_wait *cmd);
 
 ///////////////////////////////////////////////////////////////////////////////
 // Constants
@@ -85,7 +95,6 @@ const struct pci_device_id known_devices[] = {
 	{0}
 };
 
-// TODO: Does it matter? How?
 struct class device_class = {
 	.name = "uharddoom",
 	.owner = THIS_MODULE,
@@ -103,11 +112,10 @@ struct pci_driver driver_api = {
 
 struct file_operations file_api = {
 	.owner = THIS_MODULE,
-	.open           = file_open,
-	.mmap           = file_mmap,
-	.release        = file_release,
-	.compat_ioctl   = file_compat_ioctl,
-	.unlocked_ioctl = file_unlocked_ioctl,
+	.open           = chardev_open,
+	.release        = chardev_release,
+	.compat_ioctl   = chardev_ioctl,
+	.unlocked_ioctl = chardev_ioctl,
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -205,7 +213,7 @@ struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev)
 		goto out;
 	}
 
-	status = kzalloc(sizeof(struct DeviceCtx), GFP_KERNEL);
+	status = kzalloc(sizeof(*status), GFP_KERNEL);
 	if (status == NULL) {
 		status = ERR_PTR(-ENOMEM);
 		goto out;
@@ -213,6 +221,7 @@ struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev)
 	devices[idx] = status;
 	devices[idx]->index = idx;
 	devices[idx]->pci_dev = pci_dev;
+	INIT_LIST_HEAD(&devices[idx]->users);
 	pci_set_drvdata(pci_dev, devices[idx]);
 out:
 	mutex_unlock(&devices_mutex);
@@ -314,21 +323,13 @@ int dev_init_chardev(struct DeviceCtx* device)
 {
 	struct device* parent_dev = NULL;
 	struct device* sysfs = NULL;
-	struct cdev* cdev = NULL;
 	dev_t devt = devt_base + device->index;
 	int error = 0;
 
-	cdev = cdev_alloc();
-	if (IS_ERR(cdev)) {
-		error = PTR_ERR(cdev);
-		cry(cdev_alloc, error);
-		goto out;
-	}
-	cdev->ops = &file_api;
-	cdev->owner = THIS_MODULE;
-	device->cdev = cdev;
+	cdev_init(&device->cdev, &file_api);
+	device->cdev.owner = THIS_MODULE;
 
-	error = cdev_add(device->cdev, devt, 1);
+	error = cdev_add(&device->cdev, devt, 1);
 	if (error) {
 		cry(cdev_add, error);
 		goto out;
@@ -448,9 +449,9 @@ void dev_remove(struct pci_dev *dev)
 		device->sysfs = NULL;
 	}
 
-	if (device->cdev) {
-		cdev_del(device->cdev);
-		device->cdev = NULL;
+	if (device->cdev_add_done) {
+		cdev_del(&device->cdev);
+		device->cdev_add_done = false;
 	}
 
 	// DMA
@@ -505,29 +506,94 @@ void dev_shutdown(struct pci_dev *dev)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// File code
+// Chardev file code
 
-int file_open(struct inode *inode, struct file *file)
+int chardev_open(struct inode *inode, struct file *file)
+{
+	struct DeviceCtx *device = container_of(inode->i_cdev, struct DeviceCtx, cdev);
+	struct UserCtx *user = kzalloc(sizeof(*user), GFP_KERNEL);
+
+	if (user == NULL) {
+		return -ENOMEM;
+	}
+	// TODO increment device refcount
+	user->device = device;
+	INIT_LIST_HEAD(&user->list_node);
+	file->private_data = user;
+	list_add(&user->list_node, &device->users);
+	return nonseekable_open(inode, file);
+}
+
+long chardev_ioctl(struct file *file, unsigned int cmd, unsigned long args)
+{
+	struct UserCtx *user = file->private_data;
+	struct DeviceCtx *device = user->device;
+	union {
+		struct udoomdev_ioctl_create_buffer create;
+		struct udoomdev_ioctl_map_buffer map;
+		struct udoomdev_ioctl_unmap_buffer unmap;
+		struct udoomdev_ioctl_run run;
+		struct udoomdev_ioctl_wait wait;
+	} data;
+
+	// TODO make it compile
+	int status = 0;
+	switch (cmd) {
+		case UDOOMDEV_IOCTL_CREATE_BUFFER: status = copy_from_user(&data.create, (void*) args, sizeof(data.create)); break;
+		case UDOOMDEV_IOCTL_MAP_BUFFER:    status = copy_from_user(&data.map,    (void*) args, sizeof(data.map)); break;
+		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  status = copy_from_user(&data.unmap,  (void*) args, sizeof(data.unmap)); break;
+		case UDOOMDEV_IOCTL_RUN:           status = copy_from_user(&data.run,    (void*) args, sizeof(data.run)); break;
+		case UDOOMDEV_IOCTL_WAIT:          status = copy_from_user(&data.wait,   (void*) args, sizeof(data.wait)); break;
+	}
+
+	if (status > 0) {
+		dbg("detected ioctl fault");
+		return -EFAULT;
+	}
+
+	switch (cmd) {
+		case UDOOMDEV_IOCTL_CREATE_BUFFER: return do_create_buffer(device, user, &data.create);
+		case UDOOMDEV_IOCTL_MAP_BUFFER:    return do_map_buffer(device, user, &data.map);
+		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  return do_unmap_buffer(device, user, &data.unmap);
+		case UDOOMDEV_IOCTL_RUN:           return do_run(device, user, &data.run);
+		case UDOOMDEV_IOCTL_WAIT:          return do_wait(device, user, &data.wait);
+	}
+
+	
+	return -ENOTTY;
+}
+
+int chardev_release(struct inode *inode, struct file *file)
+{
+	// TODO cleanup
+	return -EIO;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Buffers code
+
+
+long do_create_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_create_buffer *cmd)
 {
 	return -EIO;
 }
 
-long file_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long args)
+long do_map_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_map_buffer *cmd)
 {
 	return -EIO;
 }
 
-long file_compat_ioctl(struct file *file, unsigned int cmd, unsigned long args)
+long do_unmap_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_unmap_buffer *cmd)
 {
 	return -EIO;
 }
 
-int file_mmap(struct file *file, struct vm_area_struct *vm)
+long do_run(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_run *cmd)
 {
 	return -EIO;
 }
 
-int file_release(struct inode *inode, struct file *file)
+long do_wait(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_wait *cmd)
 {
 	return -EIO;
 }
