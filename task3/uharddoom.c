@@ -4,8 +4,10 @@
 #include <linux/pm.h>
 #include <linux/types.h>
 #include <linux/slab.h>
-
 #include <linux/cdev.h>
+#include <linux/anon_inodes.h>
+#include <linux/mman.h>
+#include <linux/file.h>
 
 #include "uharddoom.h"
 #include "udoomfw.h"
@@ -16,17 +18,38 @@
 //          Np. po wgraniu firmware.
 
 ///////////////////////////////////////////////////////////////////////////////
+// Assumptions & decisions
+/*
+- Buffer's file private data = Buffer*
+
+Remove shit like (?):
+mem = alloc()
+if () ...
+dev->mem = mem;
+
+TODO:
+Make sure to use consistently IS_ERR_OR_NULL;
+Last allocation part should return 
+
+Use __cpu_to_le32
+
+*/
+
+_Static_assert(sizeof(dma_addr_t) == 8, "");
+#define PAGE_ENTRIES 1024
+#define UDOOMDEV_DMA_MASK (DMA_BIT_MASK(40))
+
+///////////////////////////////////////////////////////////////////////////////
 // Structs
 
 struct DeviceCtx {
 	size_t index;
-	struct list_head users;
+	struct list_head contexts; // struct AddressSpace
 
 	struct cdev cdev;
 	struct device* sysfs;
 	struct pci_dev* pci_dev;
 	void __iomem* iomem;
-	
 
 	bool pci_enable_device_done;
 	bool pci_request_regions_done;
@@ -37,17 +60,57 @@ struct DeviceCtx {
 	// device_create_done == sysfs;
 };
 
-struct UserCtx {
+typedef uint32_t dev_addr_t;
+
+typedef struct {
+	uint32_t value;
+} page_tab_entry_t;
+
+struct PageTab {
+	page_tab_entry_t entry[PAGE_ENTRIES];
+};
+
+typedef struct {
+	uint32_t value;
+} page_dir_entry_t;
+
+struct PageDir {
+	page_dir_entry_t entry[PAGE_ENTRIES];
+};
+
+struct AddressSpace {
 	struct DeviceCtx* device;
 	struct list_head list_node;
+	struct list_head buffers; // struct Buffer
+	struct list_head areas; // struct VirtArea
+
+	struct PageDir* pgd;
+	dma_addr_t pgd_dma_addr;
+	struct PageTab* pgt[PAGE_ENTRIES];
+};
+
+struct VirtArea {
+	dev_addr_t beg;
+	dev_addr_t end;
+	struct Buffer* buffer;
+	struct list_head list_node;
+};
+
+struct Buffer {
+	struct AddressSpace* ctx;
+	struct list_head list_node;
+	uint32_t size;
+	
+	void* hst_addr;
+	dma_addr_t dma_addr;
+	dev_addr_t dev_addr;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
 // Callable
 
-#define dbg(fmt, ...) printk(KERN_NOTICE "uharddoom: [%d] " fmt, __LINE__, ##__VA_ARGS__)
-#define cry(fn, value) dbg("%s(...) failed with %d\n", #fn, value)
-
+#define dbg(fmt, ...) printk(KERN_NOTICE "uharddoom@%03d: " fmt, __LINE__, ##__VA_ARGS__)
+#define cry(fn, value) dbg("%s(...) failed with %lld\n", #fn, (long long) value)
 #define W(reg, data) iowrite32(data, (void*) (((char*) device->iomem) + reg))
 #define R(reg) ioread32((void*) (((char*) device->iomem) + reg))
 
@@ -70,19 +133,61 @@ int dev_init_irq(struct DeviceCtx* device);
 int dev_init_hardware(struct DeviceCtx* device);
 int dev_init_chardev(struct DeviceCtx* device);
 irqreturn_t dev_handle_irq(int irq, void* dev);
-
 void dev_printk_status(struct DeviceCtx* device);
 
-int  chardev_open(struct inode *, struct file *);
-long chardev_ioctl(struct file *, unsigned int, unsigned long);
-int  chardev_release(struct inode *, struct file *);
+int  ctx_open(struct inode *, struct file *);
+long ctx_ioctl(struct file *, unsigned int, unsigned long);
+int  ctx_release(struct inode *, struct file *);
+long ctx_ioctl_create_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_create_buffer *cmd);
+long ctx_ioctl_map_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_map_buffer *cmd);
+long ctx_ioctl_unmap_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd);
+long ctx_ioctl_run(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd);
+long ctx_ioctl_wait(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd);
+bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos);
 
-// IOCTLs
-long do_create_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_create_buffer *cmd);
-long do_map_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_map_buffer *cmd);
-long do_unmap_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_unmap_buffer *cmd);
-long do_run(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_run *cmd);
-long do_wait(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_wait *cmd);
+
+int buffer_release(struct inode *, struct file *);
+int buffer_mmap(struct file *, struct vm_area_struct *);
+vm_fault_t buffer_host_fault(struct vm_fault *vmf);
+
+///////////////////////////////////////////////////////////////////////////////
+// Oneliners
+
+// TODO use it:
+// BUG_ON((page_tab_addr & PAGE_MASK) != 0) // must be aligned to page size
+// BUG_ON((page_tab_addr & (~UDOOMDEV_DMA_MASK)) != 0) // must fit into DMA bits
+
+bool page_dir_is_present(page_dir_entry_t entry) {
+	return (entry.value & 0x1) == 1;
+}
+
+dma_addr_t page_dir_tab_addr(page_dir_entry_t entry) {
+	return (dma_addr_t) ((entry.value >> 4) << PAGE_SHIFT);
+}
+
+page_dir_entry_t page_dir_make(dma_addr_t page_tab_addr) {
+	return (page_dir_entry_t) {
+		.value = (page_tab_addr >> 8) | 0x1
+	};
+}
+
+bool page_tab_is_present(page_tab_entry_t entry) {
+	return (entry.value & 0x1) == 1;
+}
+
+bool page_tab_is_writable(page_tab_entry_t entry) {
+	return (entry.value & 0x2) == 1;
+}
+
+dma_addr_t page_tab_dma_addr(page_tab_entry_t entry) {
+	return (dma_addr_t) ((entry.value >> 4) << PAGE_SHIFT);
+}
+
+page_tab_entry_t page_tab_make(dma_addr_t dma_addr, bool writable) {
+	return (page_tab_entry_t) {
+		.value = (dma_addr >> 8) | (writable ? 0x2 : 0) | 0x1
+	};
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Constants
@@ -110,12 +215,23 @@ struct pci_driver driver_api = {
 	.shutdown = dev_shutdown
 };
 
-struct file_operations file_api = {
+struct file_operations chardev_api = {
 	.owner = THIS_MODULE,
-	.open           = chardev_open,
-	.release        = chardev_release,
-	.compat_ioctl   = chardev_ioctl,
-	.unlocked_ioctl = chardev_ioctl,
+	.open           = ctx_open,
+	.release        = ctx_release,
+	.compat_ioctl   = ctx_ioctl,
+	.unlocked_ioctl = ctx_ioctl,
+};
+
+struct file_operations buffer_api = {
+	.owner = THIS_MODULE,
+	.release = buffer_release,
+	.mmap = buffer_mmap,
+	.mmap_supported_flags = MAP_SHARED
+};
+
+struct vm_operations_struct buffer_vm_api = {
+	.fault = buffer_host_fault,
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -210,18 +326,21 @@ struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev)
 	}
 	if (idx == MAX_DEVICE_COUNT) {
 		status = ERR_PTR(-ENOMEM);
+		cry(dev_alloc, status);
 		goto out;
 	}
 
 	status = kzalloc(sizeof(*status), GFP_KERNEL);
 	if (status == NULL) {
 		status = ERR_PTR(-ENOMEM);
+		cry(dev_alloc, status);
 		goto out;
 	}
+
 	devices[idx] = status;
 	devices[idx]->index = idx;
 	devices[idx]->pci_dev = pci_dev;
-	INIT_LIST_HEAD(&devices[idx]->users);
+	INIT_LIST_HEAD(&devices[idx]->contexts);
 	pci_set_drvdata(pci_dev, devices[idx]);
 out:
 	mutex_unlock(&devices_mutex);
@@ -259,14 +378,18 @@ int dev_init_pci(struct DeviceCtx* device)
 
 	
 	iomem = pci_iomap(device->pci_dev, 0, UHARDDOOM_BAR_SIZE);
-	if (IS_ERR(iomem)) {
+	if (IS_ERR_OR_NULL(iomem)) {
 		error = PTR_ERR(iomem);
 		cry(pci_iomap, error);
 		goto out;
 	}
 	device->iomem = iomem;
 
+	BUG_ON(error);
+	return error;
+
 out:
+	// TODO cleanup?
 	return error;
 }
 
@@ -280,13 +403,13 @@ int dev_init_dma(struct DeviceCtx* device)
 	device->pci_set_master_done = true;
 
 	// TODO czy tu jest potrzebny cleanup?
-	error = pci_set_dma_mask(device->pci_dev, DMA_BIT_MASK(32));
+	error = pci_set_dma_mask(device->pci_dev, UDOOMDEV_DMA_MASK);
 	if (error) {
 		cry(pci_set_dma_mask, error);
 		goto out;
 	}
 	
-	error = pci_set_consistent_dma_mask(device->pci_dev, DMA_BIT_MASK(32));
+	error = pci_set_consistent_dma_mask(device->pci_dev, UDOOMDEV_DMA_MASK);
 	if (error) {
 		cry(pci_set_consistent_dma_mask, error);
 		goto out;
@@ -326,7 +449,7 @@ int dev_init_chardev(struct DeviceCtx* device)
 	dev_t devt = devt_base + device->index;
 	int error = 0;
 
-	cdev_init(&device->cdev, &file_api);
+	cdev_init(&device->cdev, &chardev_api);
 	device->cdev.owner = THIS_MODULE;
 
 	error = cdev_add(&device->cdev, devt, 1);
@@ -338,7 +461,7 @@ int dev_init_chardev(struct DeviceCtx* device)
 
 	parent_dev = &device->pci_dev->dev;
 	sysfs = device_create(&device_class, parent_dev, devt, NULL, "udoom%zd", device->index);
-	if (IS_ERR(sysfs)) {
+	if (IS_ERR_OR_NULL(sysfs)) {
 		error = PTR_ERR(sysfs);
 		cry(device_create, error);
 		goto out;
@@ -368,7 +491,7 @@ out:
 // TODO
 irqreturn_t dev_handle_irq(int irq, void* dev)
 {
-	struct DeviceCtx* device = (struct DeviceCtx*) dev;
+	// struct DeviceCtx* device = (struct DeviceCtx*) dev;
 
 	dbg("haha interrupt %d\n", irq);
 	return IRQ_HANDLED;
@@ -384,7 +507,7 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 	dbg("device probe started\n");
 
 	device = dev_alloc(pci_dev);
-	if (IS_ERR(device)) {
+	if (IS_ERR_OR_NULL(device)) {
 		error = PTR_ERR(device);
 		goto fail;
 	}
@@ -506,28 +629,180 @@ void dev_shutdown(struct pci_dev *dev)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Chardev file code
+// Chardev interface
 
-int chardev_open(struct inode *inode, struct file *file)
+int ctx_open(struct inode *inode, struct file *file)
 {
 	struct DeviceCtx *device = container_of(inode->i_cdev, struct DeviceCtx, cdev);
-	struct UserCtx *user = kzalloc(sizeof(*user), GFP_KERNEL);
+	struct AddressSpace *ctx = NULL;
+	struct PageDir* pgd = NULL;
+	dma_addr_t pgd_dma_addr = 0;
+	int status = 0;
 
-	if (user == NULL) {
-		return -ENOMEM;
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (IS_ERR_OR_NULL(ctx)) {
+		status = -ENOMEM;
+		cry(kzalloc, status);
+		goto err;
 	}
-	// TODO increment device refcount
-	user->device = device;
-	INIT_LIST_HEAD(&user->list_node);
-	file->private_data = user;
-	list_add(&user->list_node, &device->users);
+
+	pgd = dma_alloc_coherent(&device->pci_dev->dev, sizeof(*pgd), &pgd_dma_addr, GFP_KERNEL);
+	if (IS_ERR_OR_NULL(pgd)) {
+		status = -ENOMEM;
+		cry(dma_alloc_coherent, status);
+		goto err;
+	}
+	ctx->pgd = pgd;
+	ctx->pgd_dma_addr = pgd_dma_addr;
+
+	// DeviceCtx init safe part
+	// TODO increment device refcount (?)
+	ctx->device = device;
+	file->private_data = ctx;
+	INIT_LIST_HEAD(&ctx->areas);
+	INIT_LIST_HEAD(&ctx->buffers);
+	INIT_LIST_HEAD(&ctx->list_node);
+	list_add(&ctx->list_node, &device->contexts);
 	return nonseekable_open(inode, file);
+
+err:
+	if (ctx != NULL) {
+		kfree(ctx);
+	}
+	if (pgd != NULL) {
+		dma_free_coherent(&device->pci_dev->dev, sizeof(*pgd), pgd, pgd_dma_addr);
+	}
+	return status;
+
 }
 
-long chardev_ioctl(struct file *file, unsigned int cmd, unsigned long args)
+int ctx_release(struct inode *inode, struct file *file)
 {
-	struct UserCtx *user = file->private_data;
-	struct DeviceCtx *device = user->device;
+	// TODO cleanup
+	return -EIO;
+}
+
+long ctx_ioctl_create_buffer(struct DeviceCtx* device, struct AddressSpace* ctx, struct udoomdev_ioctl_create_buffer* cmd)
+{
+	struct Buffer* buff = NULL;
+	dma_addr_t dma_addr = {0};
+	void* hst_addr = NULL;
+	long status = 0;
+	dbg("creating buffer\n");
+
+	buff = kzalloc(sizeof(*buff), GFP_KERNEL);
+	if (buff == NULL) {
+		status = -ENOMEM;
+		cry(kzalloc, status);
+		goto err;
+	}
+	INIT_LIST_HEAD(&buff->list_node);
+	
+	// TODO handle larger allocations
+	hst_addr = dma_alloc_coherent(&device->pci_dev->dev, cmd->size, &dma_addr, GFP_KERNEL);
+	if (IS_ERR_OR_NULL(hst_addr)) {
+		status = -ENOMEM;
+		cry(dma_alloc_coherent, status);
+		goto err;
+	}
+
+	buff->hst_addr = hst_addr;
+	buff->dma_addr = dma_addr;
+	buff->size = cmd->size;
+
+	// Create fd for buffer, copying chardev file flags.
+	status = anon_inode_getfd(THIS_MODULE->name, &buffer_api, buff, O_RDWR);
+	if (IS_ERR_VALUE(status)) {
+		cry(anon_inode_getfd, status);
+		goto err;
+	}
+
+	BUG_ON(IS_ERR_VALUE(status));
+
+	buff->ctx = ctx;
+	list_add(&buff->list_node, &ctx->buffers);
+	dbg("buffer created: %d\n", (int) status);
+	return status;
+
+err:
+	if (buff != NULL) {
+		kfree(buff);
+	}
+	return status;
+}
+
+long ctx_ioctl_map_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_map_buffer *cmd)
+{
+	struct fd fd = fdget(cmd->buf_fd);
+	struct Buffer* buff = (fd.file == NULL) ? NULL : fd.file->private_data;
+	long status = 0;
+	
+	if (buff == NULL) {
+		status = -EBADF;
+		goto err;
+	}
+
+	
+err:
+	return status;
+}
+
+long ctx_ioctl_unmap_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd)
+{
+	return -EIO;
+}
+
+long ctx_ioctl_run(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd)
+{
+	return -EIO;
+}
+
+long ctx_ioctl_wait(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd)
+{
+	return -EIO;
+}
+
+bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos)
+{
+	struct list_head *curr = &ctx->areas;
+	struct list_head *next = ctx->areas.next;
+	struct VirtArea* curr_entry = NULL;
+	struct VirtArea* next_entry = NULL;
+	dev_addr_t hole_beg = 0;
+	dev_addr_t hole_end = 0;
+
+	if (list_empty(&ctx->areas)) {
+		*out = 0;
+		*pos = &ctx->areas;
+		return true;
+	}
+
+	// Consider holes between curr and next.
+	do {
+		curr_entry = (curr == &ctx->areas) ? NULL : list_entry(curr, struct VirtArea, list_node);
+		next_entry = (next == &ctx->areas) ? NULL : list_entry(next, struct VirtArea, list_node);
+
+		hole_beg = curr_entry == NULL ? 0 : curr_entry->end;
+		hole_end = next_entry == NULL ? UINT_MAX : next_entry->beg;
+		
+		if (hole_end - hole_beg >= size) {
+			*out = hole_beg;
+			*pos = curr;
+			return true;
+		}
+
+		curr = next;
+		next = next->next;
+	}
+	while (curr != &ctx->areas);
+
+	return false;
+}
+
+long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
+{
+	struct AddressSpace *ctx = file->private_data;
+	struct DeviceCtx *device = ctx->device;
 	union {
 		struct udoomdev_ioctl_create_buffer create;
 		struct udoomdev_ioctl_map_buffer map;
@@ -552,50 +827,61 @@ long chardev_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 	}
 
 	switch (cmd) {
-		case UDOOMDEV_IOCTL_CREATE_BUFFER: return do_create_buffer(device, user, &data.create);
-		case UDOOMDEV_IOCTL_MAP_BUFFER:    return do_map_buffer(device, user, &data.map);
-		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  return do_unmap_buffer(device, user, &data.unmap);
-		case UDOOMDEV_IOCTL_RUN:           return do_run(device, user, &data.run);
-		case UDOOMDEV_IOCTL_WAIT:          return do_wait(device, user, &data.wait);
+		case UDOOMDEV_IOCTL_CREATE_BUFFER: return ctx_ioctl_create_buffer(device, ctx, &data.create);
+		case UDOOMDEV_IOCTL_MAP_BUFFER:    return ctx_ioctl_map_buffer(device, ctx, &data.map);
+		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  return ctx_ioctl_unmap_buffer(device, ctx, &data.unmap);
+		case UDOOMDEV_IOCTL_RUN:           return ctx_ioctl_run(device, ctx, &data.run);
+		case UDOOMDEV_IOCTL_WAIT:          return ctx_ioctl_wait(device, ctx, &data.wait);
 	}
 
 	
 	return -ENOTTY;
 }
 
-int chardev_release(struct inode *inode, struct file *file)
-{
-	// TODO cleanup
-	return -EIO;
-}
-
 ///////////////////////////////////////////////////////////////////////////////
-// Buffers code
+// Buffer interface
 
-
-long do_create_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_create_buffer *cmd)
+int buffer_release(struct inode* inode, struct file* filp)
 {
 	return -EIO;
 }
 
-long do_map_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_map_buffer *cmd)
+int buffer_mmap(struct file* filp, struct vm_area_struct* vma)
 {
-	return -EIO;
+	dbg("mmap start\n");
+	vma->vm_ops = &buffer_vm_api;
+	dbg("mmap end\n");
+	return 0; 
 }
 
-long do_unmap_buffer(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_unmap_buffer *cmd)
-{
-	return -EIO;
-}
+// TODO: dlaczego osobno alokowac kazda strone?
 
-long do_run(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_run *cmd)
+vm_fault_t buffer_host_fault(struct vm_fault *vmf)
 {
-	return -EIO;
-}
+	struct file* filp = vmf->vma->vm_file;
+	struct Buffer* buff = filp->private_data;
+	struct page* page = NULL;
 
-long do_wait(struct DeviceCtx *device, struct UserCtx *user, struct udoomdev_ioctl_wait *cmd)
-{
-	return -EIO;
+    // zweryfikować, że pgoff mieści się w rozmiarze bufora (jeśli nie, zwrócić VM_FAULT_SIGBUS)
+	if (vmf->pgoff != 0) {
+		dbg("buffer_host_fault: pgoff >= buff->size\n");
+		
+		return VM_FAULT_SIGBUS;
+	}
+
+    // wziąć adres wirtualny (w jądrze) odpowiedniej strony bufora i przekształcić go przez virt_to_page na struct page *
+	page = virt_to_page(buff->hst_addr);
+
+	// zwiększyć licznik referencji do tej strony (get_page)
+	get_page(page);
+    
+	// wstawić wskaźnik na tą strukturę do otrzymanej struktury vm_fault (pole page)
+	vmf->page = page;
+    // zwrócić 0
+	
+	dbg("buffer fault\n");
+	return 0;
+
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -630,41 +916,41 @@ void dev_printk_status(struct DeviceCtx* device)
 	dbg("UHARDDOOM_STATUS_COL: %u\n", (status & UHARDDOOM_STATUS_COL));
 	dbg("UHARDDOOM_STATUS_FX: %u\n", (status & UHARDDOOM_STATUS_FX));
 	dbg("UHARDDOOM_STATUS_SWR: %u\n", (status & UHARDDOOM_STATUS_SWR));
-	dbg("UHARDDOOM_STATUS_FIFO_SRDCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDCMD));
-	dbg("UHARDDOOM_STATUS_FIFO_SPANCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANCMD));
-	dbg("UHARDDOOM_STATUS_FIFO_COLCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLCMD));
-	dbg("UHARDDOOM_STATUS_FIFO_FXCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXCMD));
-	dbg("UHARDDOOM_STATUS_FIFO_SWRCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SWRCMD));
-	dbg("UHARDDOOM_STATUS_FIFO_COLIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLIN));
-	dbg("UHARDDOOM_STATUS_FIFO_FXIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXIN));
-	dbg("UHARDDOOM_STATUS_FIFO_FESEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_FESEM));
-	dbg("UHARDDOOM_STATUS_FIFO_SRDSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDSEM));
-	dbg("UHARDDOOM_STATUS_FIFO_COLSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLSEM));
-	dbg("UHARDDOOM_STATUS_FIFO_SPANSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANSEM));
-	dbg("UHARDDOOM_STATUS_FIFO_SPANOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANOUT));
-	dbg("UHARDDOOM_STATUS_FIFO_COLOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLOUT));
-	dbg("UHARDDOOM_STATUS_FIFO_FXOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXOUT));
+	// dbg("UHARDDOOM_STATUS_FIFO_SRDCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDCMD));
+	// dbg("UHARDDOOM_STATUS_FIFO_SPANCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANCMD));
+	// dbg("UHARDDOOM_STATUS_FIFO_COLCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLCMD));
+	// dbg("UHARDDOOM_STATUS_FIFO_FXCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXCMD));
+	// dbg("UHARDDOOM_STATUS_FIFO_SWRCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SWRCMD));
+	// dbg("UHARDDOOM_STATUS_FIFO_COLIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLIN));
+	// dbg("UHARDDOOM_STATUS_FIFO_FXIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXIN));
+	// dbg("UHARDDOOM_STATUS_FIFO_FESEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_FESEM));
+	// dbg("UHARDDOOM_STATUS_FIFO_SRDSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDSEM));
+	// dbg("UHARDDOOM_STATUS_FIFO_COLSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLSEM));
+	// dbg("UHARDDOOM_STATUS_FIFO_SPANSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANSEM));
+	// dbg("UHARDDOOM_STATUS_FIFO_SPANOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANOUT));
+	// dbg("UHARDDOOM_STATUS_FIFO_COLOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLOUT));
+	// dbg("UHARDDOOM_STATUS_FIFO_FXOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXOUT));
 
-	dbg("UHARDDOOM_STAT_FW_JOB: %u\n", stats[0x00]);
-	dbg("UHARDDOOM_STAT_FW_CMD: %u\n", stats[0x01]);
-	dbg("UHARDDOOM_STAT_CMD_BLOCK: %u\n", stats[0x56]);
-	dbg("UHARDDOOM_STAT_CMD_WORD: %u\n", stats[0x57]);
-	dbg("UHARDDOOM_STAT_FE_INSN: %u\n", stats[0x58]);
-	dbg("UHARDDOOM_STAT_FE_LOAD: %u\n", stats[0x59]);
-	dbg("UHARDDOOM_STAT_FE_STORE: %u\n", stats[0x5a]);
-	dbg("UHARDDOOM_STAT_MMIO_READ: %u\n", stats[0x5c]);
-	dbg("UHARDDOOM_STAT_MMIO_WRITE: %u\n", stats[0x5d]);
-	dbg("UHARDDOOM_STAT_SRD_CMD: %u\n", stats[0x60]);
-	dbg("UHARDDOOM_STAT_SRD_READ: %u\n", stats[0x61]);
-	dbg("UHARDDOOM_STAT_SRD_BLOCK: %u\n", stats[0x62]);
-	dbg("UHARDDOOM_STAT_SRD_FESEM: %u\n", stats[0x63]);
-	dbg("UHARDDOOM_STAT_SWR_CMD: %u\n", stats[0x78]);
-	dbg("UHARDDOOM_STAT_SWR_DRAW: %u\n", stats[0x79]);
-	dbg("UHARDDOOM_STAT_SWR_BLOCK: %u\n", stats[0x7a]);
-	dbg("UHARDDOOM_STAT_SWR_BLOCK_READ: %u\n", stats[0x7b]);
-	dbg("UHARDDOOM_STAT_SWR_BLOCK_TRANS: %u\n", stats[0x7c]);
-	dbg("UHARDDOOM_STAT_SWR_SRDSEM: %u\n", stats[0x7d]);
-	dbg("UHARDDOOM_STAT_SWR_COLSEM: %u\n", stats[0x7e]);
-	dbg("UHARDDOOM_STAT_SWR_SPANSEM: %u\n", stats[0x7f]);
+	// dbg("UHARDDOOM_STAT_FW_JOB: %u\n", stats[0x00]);
+	// dbg("UHARDDOOM_STAT_FW_CMD: %u\n", stats[0x01]);
+	// dbg("UHARDDOOM_STAT_CMD_BLOCK: %u\n", stats[0x56]);
+	// dbg("UHARDDOOM_STAT_CMD_WORD: %u\n", stats[0x57]);
+	// dbg("UHARDDOOM_STAT_FE_INSN: %u\n", stats[0x58]);
+	// dbg("UHARDDOOM_STAT_FE_LOAD: %u\n", stats[0x59]);
+	// dbg("UHARDDOOM_STAT_FE_STORE: %u\n", stats[0x5a]);
+	// dbg("UHARDDOOM_STAT_MMIO_READ: %u\n", stats[0x5c]);
+	// dbg("UHARDDOOM_STAT_MMIO_WRITE: %u\n", stats[0x5d]);
+	// dbg("UHARDDOOM_STAT_SRD_CMD: %u\n", stats[0x60]);
+	// dbg("UHARDDOOM_STAT_SRD_READ: %u\n", stats[0x61]);
+	// dbg("UHARDDOOM_STAT_SRD_BLOCK: %u\n", stats[0x62]);
+	// dbg("UHARDDOOM_STAT_SRD_FESEM: %u\n", stats[0x63]);
+	// dbg("UHARDDOOM_STAT_SWR_CMD: %u\n", stats[0x78]);
+	// dbg("UHARDDOOM_STAT_SWR_DRAW: %u\n", stats[0x79]);
+	// dbg("UHARDDOOM_STAT_SWR_BLOCK: %u\n", stats[0x7a]);
+	// dbg("UHARDDOOM_STAT_SWR_BLOCK_READ: %u\n", stats[0x7b]);
+	// dbg("UHARDDOOM_STAT_SWR_BLOCK_TRANS: %u\n", stats[0x7c]);
+	// dbg("UHARDDOOM_STAT_SWR_SRDSEM: %u\n", stats[0x7d]);
+	// dbg("UHARDDOOM_STAT_SWR_COLSEM: %u\n", stats[0x7e]);
+	// dbg("UHARDDOOM_STAT_SWR_SPANSEM: %u\n", stats[0x7f]);
 
 }
