@@ -10,6 +10,8 @@
 #include <linux/file.h>
 #include <linux/bits.h>
 
+#include <linux/vmalloc.h>
+
 #include "uharddoom.h"
 #include "udoomfw.h"
 #include "udoomdev.h"
@@ -90,18 +92,20 @@ struct AddressSpace {
 };
 
 struct VirtArea {
+	struct Buffer* buffer;
+	struct list_head list_node;
+
 	dev_addr_t beg;
 	dev_addr_t end;
 	bool writable;
-	struct Buffer* buffer;
-	struct list_head list_node;
 };
 
 struct Buffer {
 	struct AddressSpace* ctx;
 	struct list_head list_node;
-	uint32_t size;
 	
+	int fd;
+	uint32_t size;
 	void* hst_addr;
 	dma_addr_t dma_addr;
 };
@@ -133,7 +137,7 @@ int dev_init_irq(struct DeviceCtx* device);
 int dev_init_hardware(struct DeviceCtx* device);
 int dev_init_chardev(struct DeviceCtx* device);
 irqreturn_t dev_handle_irq(int irq, void* dev);
-void dev_printk_status(struct DeviceCtx* device, uint32_t flags);
+void dev_dbg_status(struct DeviceCtx* device, uint32_t flags);
 
 int  ctx_open(struct inode *, struct file *);
 long ctx_ioctl(struct file *, unsigned int, unsigned long);
@@ -145,7 +149,8 @@ long ctx_ioctl_run(struct DeviceCtx *device, struct AddressSpace *ctx, struct ud
 long ctx_ioctl_wait(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd);
 long ctx_ioctl_debug(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
 bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos);
-long ctx_install_area(struct AddressSpace* ctx, struct VirtArea* area);
+long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area);
+void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
 
 int buffer_release(struct inode *, struct file *);
 int buffer_mmap(struct file *, struct vm_area_struct *);
@@ -158,8 +163,16 @@ vm_fault_t buffer_fault(struct vm_fault *vmf);
 // BUG_ON((page_tab_addr & PAGE_MASK) != 0) // must be aligned to page size
 // BUG_ON((page_tab_addr & (~UDOOMDEV_DMA_MASK)) != 0) // must fit into DMA bits
 
+dev_addr_t page_dir_beg(size_t dir_idx) {
+	return dir_idx << 22;
+}
+
+dev_addr_t page_tab_beg(size_t dir_idx, size_t tab_idx) {
+	return dir_idx << 22 | tab_idx << 12;
+}
+
 bool page_dir_is_present(page_dir_entry_t entry) {
-	return (entry.value & 0x1) == 1;
+	return (entry.value & 0x1) != 0;
 }
 
 dma_addr_t page_dir_tab_addr(page_dir_entry_t entry) {
@@ -185,11 +198,11 @@ page_dir_entry_t page_dir_make(dma_addr_t page_tab_addr) {
 }
 
 bool page_tab_is_present(page_tab_entry_t entry) {
-	return (entry.value & 0x1) == 1;
+	return (entry.value & 0x1) != 0;
 }
 
 bool page_tab_is_writable(page_tab_entry_t entry) {
-	return (entry.value & 0x2) == 1;
+	return (entry.value & 0x2) != 0;
 }
 
 dma_addr_t page_tab_dma_addr(page_tab_entry_t entry) {
@@ -197,9 +210,12 @@ dma_addr_t page_tab_dma_addr(page_tab_entry_t entry) {
 }
 
 page_tab_entry_t page_tab_make(dma_addr_t dma_addr, bool writable) {
-	return (page_tab_entry_t) {
+	dbg("page_tab_make: %llx, %d\n", dma_addr, (int) writable);
+	page_tab_entry_t res = (page_tab_entry_t) {
 		.value = (dma_addr >> 8) | (writable ? 0x2 : 0) | 0x1
 	};
+	dbg("page_tab_make: %x: %llx %d\n", res.value, page_tab_dma_addr(res), (int) page_tab_is_writable(res));
+	return res;
 }
 
 size_t page_cnt(size_t bytes) {
@@ -439,23 +455,14 @@ out:
 int dev_init_hardware(struct DeviceCtx* device)
 {
 	size_t i;
-	// zapisać 0 do FE_CODE_ADDR,
 	W(UHARDDOOM_FE_CODE_ADDR, 0);
-	// kolejno zapisać wszystkie słowa tablicy udoomfw[] do FE_CODE_WINDOW,
 	for (i = 0; i < ARRAY_SIZE(udoomfw); ++i) {
 		W(UHARDDOOM_FE_CODE_WINDOW, udoomfw[i]);
 	}
-	// zresetować wszystkie bloki urządzenia przez zapis 0x7f7ffffe do RESET,
 	W(UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
-	// zainicjować BATCH_PDP, BATCH_GET, BATCH_PUT i BATCH_WRAP, jeśli chcemy użyć bloku wczytywania pleceń,
-	(void) 0;
-	// wyzerować INTR przez zapis 0xff33,
 	W(UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
-	// włączyć używane przez nas przerwania w INTR_ENABLE,
 	W(UHARDDOOM_INTR_ENABLE, (UHARDDOOM_INTR_MASK & (~UHARDDOOM_INTR_BATCH_WAIT)));
-	// włączyć wszystkie bloki urządzenia w ENABLE (być może z wyjątkiem BATCH).
 	W(UHARDDOOM_ENABLE, (UHARDDOOM_ENABLE_ALL & (~UHARDDOOM_ENABLE_BATCH)));
-
 	return 0;
 }
 
@@ -512,7 +519,9 @@ irqreturn_t dev_handle_irq(int irq, void* dev)
 	int i = 0;
 
 	uint32_t intr = R(UHARDDOOM_INTR);
-	uint32_t done = 0; 
+	uint32_t done = 0;
+
+	// TODO actually handle these IRQs..
 
 	if (intr & UHARDDOOM_INTR_JOB_DONE) {
 		dbg("irq: job done\n");
@@ -539,7 +548,6 @@ irqreturn_t dev_handle_irq(int irq, void* dev)
 
 	W(UHARDDOOM_INTR, done);
 	return IRQ_HANDLED;
-	// TODO
 }
 
 // Always called from process context, so it can sleep.
@@ -589,7 +597,7 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 	dbg("device probe done [%zd]\n", device->index);
 
 
-	dev_printk_status(device, UDOOMDEV_DEBUG_STATUS_BASIC);
+	dev_dbg_status(device, UDOOMDEV_DEBUG_STATUS_BASIC);
 	return 0;
 
 fail:
@@ -716,8 +724,8 @@ err:
 	if (pgd != NULL) {
 		dma_free_coherent(&device->pci_dev->dev, sizeof(*pgd), pgd, pgd_dma);
 	}
+	BUG();
 	return status;
-
 }
 
 int ctx_release(struct inode *inode, struct file *file)
@@ -750,10 +758,6 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* device, struct AddressSpace* ctx,
 		goto err;
 	}
 
-	buff->hst_addr = hst_addr;
-	buff->dma_addr = dma_addr;
-	buff->size = cmd->size;
-
 	// Create fd for buffer, copying chardev file flags.
 	status = anon_inode_getfd(THIS_MODULE->name, &buffer_api, buff, O_RDWR);
 	if (IS_ERR_VALUE(status)) {
@@ -764,14 +768,16 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* device, struct AddressSpace* ctx,
 	BUG_ON(IS_ERR_VALUE(status));
 
 	buff->ctx = ctx;
+	buff->fd = status;
+	buff->hst_addr = hst_addr;
+	buff->dma_addr = dma_addr;
+	buff->size = cmd->size;
 	list_add(&buff->list_node, &ctx->buffers);
 	dbg("buffer created: %d\n", (int) status);
 	return status;
 
 err:
-	if (buff != NULL) {
-		kfree(buff);
-	}
+	BUG();
 	return status;
 }
 
@@ -807,47 +813,44 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, st
 		goto err;
 	}
 	// TODO: overflow!
+	area->buffer = buff;
+	INIT_LIST_HEAD(&area->list_node);
 	area->beg = dev_addr;
 	area->end = dev_addr + buff->size;
-	area->buffer = buff;
 	area->writable = !cmd->map_rdonly;
 
-	status = ctx_install_area(ctx, area);
+	status = ctx_map_area(ctx, area);
 	if (IS_ERR_VALUE(status)) {
 		goto err;
 	}
 
-	INIT_LIST_HEAD(&area->list_node);
 	list_add(&area->list_node, pred);
+	return status;
 err:
-	if (area != NULL) {
-		kfree(area);
-	}
+	BUG();
 	return status;
 }
 
-long ctx_install_area(struct AddressSpace* ctx, struct VirtArea* area)
+long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
 {
 	struct PageTab* page_tab = NULL;
 	dma_addr_t page_tab_dma = 0;
-	dev_addr_t addr = area->beg;
+	size_t offset = 0;
 	size_t dir_idx = 0;
 	size_t tab_idx = 0;
+	BUG_ON(page_offset(area->beg) != 0);
 
-	dbg("devmap: area: (%u, %u) w=%u\n", area->beg, area->end, area->writable);
-	
-	BUG_ON(page_offset(addr) != 0);
+	dbg("ctx_map_area: area: (%u, %u) w=%u\n", area->beg, area->end, area->writable);
 	// TODO allocate page tables up front, so reversal is easier
+	for (; offset < area->buffer->size; offset += PAGE_SIZE) {
+		dir_idx = page_dir_index(area->beg + offset);
+		tab_idx = page_tab_index(area->beg + offset);
 
-	for (; addr < area->end; addr += PAGE_SIZE) {
-		dir_idx = page_dir_index(addr);
-		tab_idx = page_tab_index(addr);
-
-		dbg("devmap: dir_idx=%zu tab_idx=%zu\n", dir_idx, tab_idx);
+		dbg("ctx_map_area: dir_idx=%zu tab_idx=%zu\n", dir_idx, tab_idx);
 
 		// make sure page table is present:
 		if (ctx->pgts[dir_idx] == NULL) {
-			dbg("devmap: allocating page table [%zu]\n", dir_idx);
+			dbg("ctx_map_area: allocating page table [%zu]\n", dir_idx);
 			page_tab = dma_alloc_coherent(&ctx->device->pci_dev->dev, sizeof(*page_tab), &page_tab_dma, GFP_KERNEL);
 			if (IS_ERR_OR_NULL(page_tab)) {
 				cry(dma_alloc_coherent, -ENOMEM);
@@ -856,41 +859,8 @@ long ctx_install_area(struct AddressSpace* ctx, struct VirtArea* area)
 			ctx->pgts[dir_idx] = page_tab;
 			ctx->pgd->entry[dir_idx] = page_dir_make(page_tab_dma);
 		}
-		ctx->pgts[dir_idx]->entry[tab_idx] = page_tab_make(addr, area->writable);
+		ctx->pgts[dir_idx]->entry[tab_idx] = page_tab_make(area->buffer->dma_addr + offset, area->writable);
 	}
-	return 0;
-}
-
-long ctx_ioctl_unmap_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd)
-{
-	return -EIO;
-}
-
-long ctx_ioctl_run(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd)
-{
-	// generalnie to tutaj będzie niezła zabawa z ogarnięciem synchronizacji tutaj
-
-	// wait until device is free
-	if (cmd->addr % 4 != 0 || cmd->size % 4 != 0) {
-		return -EINVAL;
-	}
-
-	while (device->busy)
-		;
-	
-	device->busy = true;
-	W(UHARDDOOM_JOB_PDP, (ctx->pgd_dma >> 12));
-	W(UHARDDOOM_JOB_CMD_PTR, cmd->addr);
-	W(UHARDDOOM_JOB_CMD_SIZE, cmd->size);
-	W(UHARDDOOM_JOB_TRIGGER, 1);
-
-	return 0;
-}
-
-long ctx_ioctl_wait(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd)
-{
-	while (device->busy)
-		;
 	return 0;
 }
 
@@ -931,11 +901,107 @@ bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, 
 	return false;
 }
 
-long ctx_ioctl_debug(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
+
+long ctx_ioctl_unmap_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd)
 {
-	dev_printk_status(device, cmd->flags);
+	return -EIO;
+}
+
+long ctx_ioctl_run(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd)
+{
+	// generalnie to tutaj będzie niezła zabawa z ogarnięciem synchronizacji tutaj
+
+	// wait until device is free
+	if (cmd->addr % 4 != 0 || cmd->size % 4 != 0) {
+		return -EINVAL;
+	}
+
+	while (device->busy)
+		;
+	
+	device->busy = true;
+	W(UHARDDOOM_JOB_PDP, (ctx->pgd_dma >> 12));
+	W(UHARDDOOM_JOB_CMD_PTR, cmd->addr);
+	W(UHARDDOOM_JOB_CMD_SIZE, cmd->size);
+	W(UHARDDOOM_JOB_TRIGGER, 1);
+
 	return 0;
 }
+
+long ctx_ioctl_wait(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd)
+{
+	while (device->busy)
+		;
+	return 0;
+}
+
+long ctx_ioctl_debug(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
+{
+	if (cmd->flags & UDOOMDEV_DEBUG_VMEM) {
+		ctx_dbg_vmem(ctx, cmd);
+	}
+	dev_dbg_status(device, cmd->flags);
+	return 0;
+}
+
+#define print(fmt, ...) written += snprintf(output + written, UDOOMDEV_DEBUG_BUFFER_SIZE - written, fmt, ##__VA_ARGS__)
+void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
+{
+	char *output = vzalloc(UDOOMDEV_DEBUG_BUFFER_SIZE);
+	struct VirtArea* area = NULL;
+	struct Buffer* buff = NULL;
+	size_t i = 0, k = 0;
+	size_t written = 0;
+	BUG_ON(IS_ERR_OR_NULL(output));
+
+	print("Buffers:\n");
+	list_for_each_entry(buff, &ctx->buffers, list_node) {
+		print("[%d] sz=(0x%x, %u) hst=%px dma=%llx\n",
+			buff->fd, buff->size, buff->size, buff->hst_addr, buff->dma_addr
+		);
+	}
+	print("\n");
+
+	print("VirtAreas: %px (prev=%px, next=%px)\n", &ctx->areas, ctx->areas.prev, ctx->areas.next);
+	list_for_each_entry(area, &ctx->areas, list_node) {
+		// dbg("area: %px\n", area);
+		print("beg=%x end=%x w=%d buff=%d\n",
+			area->beg, area->end, area->writable, area->buffer->fd
+		);
+	}
+	print("\n");
+
+	print("Page Dir: hst=%px dma=%llx\n", ctx->pgd, ctx->pgd_dma);
+	for (i = 0; i < PAGE_ENTRIES; ++i) {
+		if (ctx->pgd->entry[i].value != 0) {
+			print("[%zu]: beg=%x hst=%px, dma=%llx\n",
+				i, page_dir_beg(i), ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
+			);
+		}
+	}
+	print("\n");
+
+	for (i = 0; i < PAGE_ENTRIES; ++i) {
+		if (ctx->pgd->entry[i].value != 0) {
+			print("Page Table[%zu]: beg=%x hst=%px, dma=%llx\n",
+				i, page_dir_beg(i), ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
+			);
+			for (k = 0; k < PAGE_ENTRIES; ++k) {
+				if (page_tab_is_present(ctx->pgts[i]->entry[k])) {
+					print("[%zu] beg=%x, dma=%llx, write=%d\n",
+						k, page_tab_beg(i, k), page_tab_dma_addr(ctx->pgts[i]->entry[k]), (int) page_tab_is_writable(ctx->pgts[i]->entry[k])
+					);
+				}
+			}
+			print("\n");
+		}
+	}
+	print("\n");
+
+	BUG_ON(copy_to_user(cmd->output, output, written));
+	vfree(output);
+}
+#undef print
 
 long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 {
@@ -1000,10 +1066,10 @@ vm_fault_t buffer_fault(struct vm_fault *vmf)
 	struct Buffer* buff = filp->private_data;
 
 	if (vmf->pgoff >= page_cnt(buff->size)) {
-		dbg("buffer_fault: out of bounds\n");		
+		dbg("buffer_fault: out of bounds\n");
 		return VM_FAULT_SIGBUS;
 	}
-	vmf->page = virt_to_page(buff->hst_addr);;
+	vmf->page = virt_to_page(buff->hst_addr + PAGE_SIZE * vmf->pgoff);
 	get_page(vmf->page);
 	return 0;
 }
@@ -1018,13 +1084,11 @@ module_exit(drv_terminate);
 ///////////////////////////////////////////////////////////////////////////////
 // Debug
 
-void dev_printk_status(struct DeviceCtx* device, unsigned flags)
+void dev_dbg_status(struct DeviceCtx* device, unsigned flags)
 {
 	static uint32_t stats[UHARDDOOM_STATS_NUM];
 	uint32_t status;
 	size_t idx;
-
-	dbg("reading state..\n");
 
 	status = R(UHARDDOOM_STATUS);
 	for (idx = 0; idx < UHARDDOOM_STATS_NUM; ++idx) {

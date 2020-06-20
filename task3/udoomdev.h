@@ -41,6 +41,7 @@ struct udoomdev_ioctl_wait {
 
 struct udoomdev_ioctl_debug {
 	uint32_t flags;
+	char *output;
 };
 
 #define UDOOMDEV_IOCTL_MAP_BUFFER _IOW('D', 0x01, struct udoomdev_ioctl_map_buffer)
@@ -53,4 +54,8 @@ struct udoomdev_ioctl_debug {
 #define UDOOMDEV_DEBUG_STATUS_FIFO 0x2
 #define UDOOMDEV_DEBUG_STAT_BASIC 0x4
 #define UDOOMDEV_DEBUG_STAT_EXT 0x8
+#define UDOOMDEV_DEBUG_VMEM 0x10
+
+#define UDOOMDEV_DEBUG_BUFFER_SIZE (1 << 20)
+
 #endif
