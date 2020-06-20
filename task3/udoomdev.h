@@ -39,9 +39,18 @@ struct udoomdev_ioctl_wait {
 	uint32_t num_back;
 };
 
+struct udoomdev_ioctl_debug {
+	uint32_t flags;
+};
+
 #define UDOOMDEV_IOCTL_MAP_BUFFER _IOW('D', 0x01, struct udoomdev_ioctl_map_buffer)
 #define UDOOMDEV_IOCTL_UNMAP_BUFFER _IOW('D', 0x02, struct udoomdev_ioctl_unmap_buffer)
 #define UDOOMDEV_IOCTL_RUN _IOW('D', 0x03, struct udoomdev_ioctl_run)
 #define UDOOMDEV_IOCTL_WAIT _IOW('D', 0x04, struct udoomdev_ioctl_wait)
+#define UDOOMDEV_IOCTL_DEBUG _IOW('D', 0x05, struct udoomdev_ioctl_debug)
 
+#define UDOOMDEV_DEBUG_STATUS_BASIC 0x1
+#define UDOOMDEV_DEBUG_STATUS_FIFO 0x2
+#define UDOOMDEV_DEBUG_STAT_BASIC 0x4
+#define UDOOMDEV_DEBUG_STAT_EXT 0x8
 #endif

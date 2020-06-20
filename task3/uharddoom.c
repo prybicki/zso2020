@@ -8,6 +8,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/mman.h>
 #include <linux/file.h>
+#include <linux/bits.h>
 
 #include "uharddoom.h"
 #include "udoomfw.h"
@@ -35,7 +36,7 @@ Use __cpu_to_le32
 
 */
 
-_Static_assert(sizeof(dma_addr_t) == 8, "");
+_Static_assert(sizeof(dma_addr_t) == 8, "system does not support 40-bit dma addresses");
 #define PAGE_ENTRIES 1024
 #define UDOOMDEV_DMA_MASK (DMA_BIT_MASK(40))
 
@@ -50,6 +51,7 @@ struct DeviceCtx {
 	struct device* sysfs;
 	struct pci_dev* pci_dev;
 	void __iomem* iomem;
+	volatile bool busy;
 
 	bool pci_enable_device_done;
 	bool pci_request_regions_done;
@@ -58,24 +60,22 @@ struct DeviceCtx {
 	bool cdev_add_done;
 	// pci_iomap_done == iomem;
 	// device_create_done == sysfs;
+	
 };
 
 typedef uint32_t dev_addr_t;
 
-typedef struct {
-	uint32_t value;
-} page_tab_entry_t;
-
-struct PageTab {
-	page_tab_entry_t entry[PAGE_ENTRIES];
-};
-
-typedef struct {
-	uint32_t value;
-} page_dir_entry_t;
+typedef struct { uint32_t value; } page_dir_entry_t;
+typedef struct { uint32_t value; } page_tab_entry_t;
+_Static_assert(sizeof(page_dir_entry_t) == sizeof(uint32_t), "compiler could not resist pointless padding");
+_Static_assert(sizeof(page_tab_entry_t) == sizeof(uint32_t), "compiler could not resist pointless padding");
 
 struct PageDir {
 	page_dir_entry_t entry[PAGE_ENTRIES];
+};
+
+struct PageTab {
+	page_tab_entry_t entry[PAGE_ENTRIES];
 };
 
 struct AddressSpace {
@@ -84,14 +84,15 @@ struct AddressSpace {
 	struct list_head buffers; // struct Buffer
 	struct list_head areas; // struct VirtArea
 
-	struct PageDir* pgd;
-	dma_addr_t pgd_dma_addr;
-	struct PageTab* pgt[PAGE_ENTRIES];
+	struct PageTab* pgts[PAGE_ENTRIES];
+	struct PageDir* pgd; // allocated with dma_alloc_coherent
+	dma_addr_t pgd_dma;
 };
 
 struct VirtArea {
 	dev_addr_t beg;
 	dev_addr_t end;
+	bool writable;
 	struct Buffer* buffer;
 	struct list_head list_node;
 };
@@ -103,7 +104,6 @@ struct Buffer {
 	
 	void* hst_addr;
 	dma_addr_t dma_addr;
-	dev_addr_t dev_addr;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -133,7 +133,7 @@ int dev_init_irq(struct DeviceCtx* device);
 int dev_init_hardware(struct DeviceCtx* device);
 int dev_init_chardev(struct DeviceCtx* device);
 irqreturn_t dev_handle_irq(int irq, void* dev);
-void dev_printk_status(struct DeviceCtx* device);
+void dev_printk_status(struct DeviceCtx* device, uint32_t flags);
 
 int  ctx_open(struct inode *, struct file *);
 long ctx_ioctl(struct file *, unsigned int, unsigned long);
@@ -143,12 +143,13 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, st
 long ctx_ioctl_unmap_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd);
 long ctx_ioctl_run(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd);
 long ctx_ioctl_wait(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd);
+long ctx_ioctl_debug(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
 bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos);
-
+long ctx_install_area(struct AddressSpace* ctx, struct VirtArea* area);
 
 int buffer_release(struct inode *, struct file *);
 int buffer_mmap(struct file *, struct vm_area_struct *);
-vm_fault_t buffer_host_fault(struct vm_fault *vmf);
+vm_fault_t buffer_fault(struct vm_fault *vmf);
 
 ///////////////////////////////////////////////////////////////////////////////
 // Oneliners
@@ -163,6 +164,18 @@ bool page_dir_is_present(page_dir_entry_t entry) {
 
 dma_addr_t page_dir_tab_addr(page_dir_entry_t entry) {
 	return (dma_addr_t) ((entry.value >> 4) << PAGE_SHIFT);
+}
+
+size_t page_dir_index(dev_addr_t dev_addr) {
+	return (size_t) ((dev_addr & GENMASK(31, 22)) >> 22);
+}
+
+size_t page_tab_index(dev_addr_t dev_addr) {
+	return (size_t) ((dev_addr & GENMASK(21, 12)) >> 12);
+}
+
+size_t page_offset(dev_addr_t dev_addr) {
+	return (size_t) ((dev_addr & GENMASK(11, 0)));
 }
 
 page_dir_entry_t page_dir_make(dma_addr_t page_tab_addr) {
@@ -187,6 +200,10 @@ page_tab_entry_t page_tab_make(dma_addr_t dma_addr, bool writable) {
 	return (page_tab_entry_t) {
 		.value = (dma_addr >> 8) | (writable ? 0x2 : 0) | 0x1
 	};
+}
+
+size_t page_cnt(size_t bytes) {
+	return (bytes - 1) / PAGE_SIZE + 1;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -231,7 +248,7 @@ struct file_operations buffer_api = {
 };
 
 struct vm_operations_struct buffer_vm_api = {
-	.fault = buffer_host_fault,
+	.fault = buffer_fault,
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -491,9 +508,36 @@ out:
 // TODO
 irqreturn_t dev_handle_irq(int irq, void* dev)
 {
-	// struct DeviceCtx* device = (struct DeviceCtx*) dev;
+	struct DeviceCtx* device = (struct DeviceCtx*) dev;
+	int i = 0;
 
-	dbg("haha interrupt %d\n", irq);
+	uint32_t intr = R(UHARDDOOM_INTR);
+	uint32_t done = 0; 
+
+	if (intr & UHARDDOOM_INTR_JOB_DONE) {
+		dbg("irq: job done\n");
+		device->busy = false;
+		done |= UHARDDOOM_INTR_JOB_DONE;
+	}
+
+	if (intr & UHARDDOOM_INTR_FE_ERROR) {
+		dbg("irg: fe error\n");
+		done |= UHARDDOOM_INTR_FE_ERROR;
+	}
+
+	if (intr & UHARDDOOM_INTR_CMD_ERROR) {
+		dbg("irg: cmd error\n");
+		done |= UHARDDOOM_INTR_CMD_ERROR;
+	}
+
+	for (; i < 8; ++i) {
+		if (intr & UHARDDOOM_INTR_PAGE_FAULT(i)) {
+			dbg("irq: fault %d\n", i);
+			done |= UHARDDOOM_INTR_PAGE_FAULT(i);
+		}
+	}
+
+	W(UHARDDOOM_INTR, done);
 	return IRQ_HANDLED;
 	// TODO
 }
@@ -545,7 +589,7 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 	dbg("device probe done [%zd]\n", device->index);
 
 
-	dev_printk_status(device);
+	dev_printk_status(device, UDOOMDEV_DEBUG_STATUS_BASIC);
 	return 0;
 
 fail:
@@ -636,7 +680,7 @@ int ctx_open(struct inode *inode, struct file *file)
 	struct DeviceCtx *device = container_of(inode->i_cdev, struct DeviceCtx, cdev);
 	struct AddressSpace *ctx = NULL;
 	struct PageDir* pgd = NULL;
-	dma_addr_t pgd_dma_addr = 0;
+	dma_addr_t pgd_dma = 0;
 	int status = 0;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
@@ -646,14 +690,14 @@ int ctx_open(struct inode *inode, struct file *file)
 		goto err;
 	}
 
-	pgd = dma_alloc_coherent(&device->pci_dev->dev, sizeof(*pgd), &pgd_dma_addr, GFP_KERNEL);
+	pgd = dma_alloc_coherent(&device->pci_dev->dev, sizeof(*pgd), &pgd_dma, GFP_KERNEL);
 	if (IS_ERR_OR_NULL(pgd)) {
 		status = -ENOMEM;
 		cry(dma_alloc_coherent, status);
 		goto err;
 	}
 	ctx->pgd = pgd;
-	ctx->pgd_dma_addr = pgd_dma_addr;
+	ctx->pgd_dma = pgd_dma;
 
 	// DeviceCtx init safe part
 	// TODO increment device refcount (?)
@@ -670,7 +714,7 @@ err:
 		kfree(ctx);
 	}
 	if (pgd != NULL) {
-		dma_free_coherent(&device->pci_dev->dev, sizeof(*pgd), pgd, pgd_dma_addr);
+		dma_free_coherent(&device->pci_dev->dev, sizeof(*pgd), pgd, pgd_dma);
 	}
 	return status;
 
@@ -735,16 +779,86 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, st
 {
 	struct fd fd = fdget(cmd->buf_fd);
 	struct Buffer* buff = (fd.file == NULL) ? NULL : fd.file->private_data;
+	struct list_head* pred = NULL;
+	struct VirtArea* area = NULL;
+	dev_addr_t dev_addr = 0;
 	long status = 0;
-	
+
+	dbg("map_buffer: fd=%u writable=%u\n", cmd->buf_fd, !cmd->map_rdonly);
+
 	if (buff == NULL) {
 		status = -EBADF;
+		dbg("ctx_ioctl_map_buffer: bad file descriptor");
 		goto err;
 	}
 
-	
+	if (!ctx_find_free_area(ctx, buff->size, &dev_addr, &pred)) {
+		status = -ENOMEM;
+		cry(ctx_find_free_area, status);
+		goto err;
+	}
+
+	dbg("map_buffer: mapping %u -> %u\n", cmd->buf_fd, dev_addr);
+
+	area = kzalloc(sizeof(*area), GFP_KERNEL);
+	if (IS_ERR_OR_NULL(area)) {
+		status = -ENOMEM;
+		cry(kzalloc, status);
+		goto err;
+	}
+	// TODO: overflow!
+	area->beg = dev_addr;
+	area->end = dev_addr + buff->size;
+	area->buffer = buff;
+	area->writable = !cmd->map_rdonly;
+
+	status = ctx_install_area(ctx, area);
+	if (IS_ERR_VALUE(status)) {
+		goto err;
+	}
+
+	INIT_LIST_HEAD(&area->list_node);
+	list_add(&area->list_node, pred);
 err:
+	if (area != NULL) {
+		kfree(area);
+	}
 	return status;
+}
+
+long ctx_install_area(struct AddressSpace* ctx, struct VirtArea* area)
+{
+	struct PageTab* page_tab = NULL;
+	dma_addr_t page_tab_dma = 0;
+	dev_addr_t addr = area->beg;
+	size_t dir_idx = 0;
+	size_t tab_idx = 0;
+
+	dbg("devmap: area: (%u, %u) w=%u\n", area->beg, area->end, area->writable);
+	
+	BUG_ON(page_offset(addr) != 0);
+	// TODO allocate page tables up front, so reversal is easier
+
+	for (; addr < area->end; addr += PAGE_SIZE) {
+		dir_idx = page_dir_index(addr);
+		tab_idx = page_tab_index(addr);
+
+		dbg("devmap: dir_idx=%zu tab_idx=%zu\n", dir_idx, tab_idx);
+
+		// make sure page table is present:
+		if (ctx->pgts[dir_idx] == NULL) {
+			dbg("devmap: allocating page table [%zu]\n", dir_idx);
+			page_tab = dma_alloc_coherent(&ctx->device->pci_dev->dev, sizeof(*page_tab), &page_tab_dma, GFP_KERNEL);
+			if (IS_ERR_OR_NULL(page_tab)) {
+				cry(dma_alloc_coherent, -ENOMEM);
+				BUG();
+			}
+			ctx->pgts[dir_idx] = page_tab;
+			ctx->pgd->entry[dir_idx] = page_dir_make(page_tab_dma);
+		}
+		ctx->pgts[dir_idx]->entry[tab_idx] = page_tab_make(addr, area->writable);
+	}
+	return 0;
 }
 
 long ctx_ioctl_unmap_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd)
@@ -754,12 +868,30 @@ long ctx_ioctl_unmap_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, 
 
 long ctx_ioctl_run(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd)
 {
-	return -EIO;
+	// generalnie to tutaj będzie niezła zabawa z ogarnięciem synchronizacji tutaj
+
+	// wait until device is free
+	if (cmd->addr % 4 != 0 || cmd->size % 4 != 0) {
+		return -EINVAL;
+	}
+
+	while (device->busy)
+		;
+	
+	device->busy = true;
+	W(UHARDDOOM_JOB_PDP, (ctx->pgd_dma >> 12));
+	W(UHARDDOOM_JOB_CMD_PTR, cmd->addr);
+	W(UHARDDOOM_JOB_CMD_SIZE, cmd->size);
+	W(UHARDDOOM_JOB_TRIGGER, 1);
+
+	return 0;
 }
 
 long ctx_ioctl_wait(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd)
 {
-	return -EIO;
+	while (device->busy)
+		;
+	return 0;
 }
 
 bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos)
@@ -799,6 +931,12 @@ bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, 
 	return false;
 }
 
+long ctx_ioctl_debug(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
+{
+	dev_printk_status(device, cmd->flags);
+	return 0;
+}
+
 long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 {
 	struct AddressSpace *ctx = file->private_data;
@@ -809,6 +947,7 @@ long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 		struct udoomdev_ioctl_unmap_buffer unmap;
 		struct udoomdev_ioctl_run run;
 		struct udoomdev_ioctl_wait wait;
+		struct udoomdev_ioctl_debug debug;
 	} data;
 
 	// TODO make it compile
@@ -819,10 +958,11 @@ long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  status = copy_from_user(&data.unmap,  (void*) args, sizeof(data.unmap)); break;
 		case UDOOMDEV_IOCTL_RUN:           status = copy_from_user(&data.run,    (void*) args, sizeof(data.run)); break;
 		case UDOOMDEV_IOCTL_WAIT:          status = copy_from_user(&data.wait,   (void*) args, sizeof(data.wait)); break;
+		case UDOOMDEV_IOCTL_DEBUG:         status = copy_from_user(&data.debug,  (void*) args, sizeof(data.debug)); break;
 	}
 
 	if (status > 0) {
-		dbg("detected ioctl fault");
+		dbg("ctx_ioctl: fault");
 		return -EFAULT;
 	}
 
@@ -832,9 +972,9 @@ long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  return ctx_ioctl_unmap_buffer(device, ctx, &data.unmap);
 		case UDOOMDEV_IOCTL_RUN:           return ctx_ioctl_run(device, ctx, &data.run);
 		case UDOOMDEV_IOCTL_WAIT:          return ctx_ioctl_wait(device, ctx, &data.wait);
+		case UDOOMDEV_IOCTL_DEBUG:         return ctx_ioctl_debug(device, ctx, &data.debug);
 	}
 
-	
 	return -ENOTTY;
 }
 
@@ -854,34 +994,18 @@ int buffer_mmap(struct file* filp, struct vm_area_struct* vma)
 	return 0; 
 }
 
-// TODO: dlaczego osobno alokowac kazda strone?
-
-vm_fault_t buffer_host_fault(struct vm_fault *vmf)
+vm_fault_t buffer_fault(struct vm_fault *vmf)
 {
 	struct file* filp = vmf->vma->vm_file;
 	struct Buffer* buff = filp->private_data;
-	struct page* page = NULL;
 
-    // zweryfikować, że pgoff mieści się w rozmiarze bufora (jeśli nie, zwrócić VM_FAULT_SIGBUS)
-	if (vmf->pgoff != 0) {
-		dbg("buffer_host_fault: pgoff >= buff->size\n");
-		
+	if (vmf->pgoff >= page_cnt(buff->size)) {
+		dbg("buffer_fault: out of bounds\n");		
 		return VM_FAULT_SIGBUS;
 	}
-
-    // wziąć adres wirtualny (w jądrze) odpowiedniej strony bufora i przekształcić go przez virt_to_page na struct page *
-	page = virt_to_page(buff->hst_addr);
-
-	// zwiększyć licznik referencji do tej strony (get_page)
-	get_page(page);
-    
-	// wstawić wskaźnik na tą strukturę do otrzymanej struktury vm_fault (pole page)
-	vmf->page = page;
-    // zwrócić 0
-	
-	dbg("buffer fault\n");
+	vmf->page = virt_to_page(buff->hst_addr);;
+	get_page(vmf->page);
 	return 0;
-
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -894,7 +1018,7 @@ module_exit(drv_terminate);
 ///////////////////////////////////////////////////////////////////////////////
 // Debug
 
-void dev_printk_status(struct DeviceCtx* device)
+void dev_printk_status(struct DeviceCtx* device, unsigned flags)
 {
 	static uint32_t stats[UHARDDOOM_STATS_NUM];
 	uint32_t status;
@@ -907,50 +1031,60 @@ void dev_printk_status(struct DeviceCtx* device)
 		stats[idx] = R(UHARDDOOM_STATS(idx));
 	}
 
-	dbg("UHARDDOOM_STATUS_BATCH: %u\n", (status & UHARDDOOM_STATUS_BATCH));
-	dbg("UHARDDOOM_STATUS_JOB: %u\n", (status & UHARDDOOM_STATUS_JOB));
-	dbg("UHARDDOOM_STATUS_CMD: %u\n", (status & UHARDDOOM_STATUS_CMD));
-	dbg("UHARDDOOM_STATUS_FE: %u\n", (status & UHARDDOOM_STATUS_FE));
-	dbg("UHARDDOOM_STATUS_SRD: %u\n", (status & UHARDDOOM_STATUS_SRD));
-	dbg("UHARDDOOM_STATUS_SPAN: %u\n", (status & UHARDDOOM_STATUS_SPAN));
-	dbg("UHARDDOOM_STATUS_COL: %u\n", (status & UHARDDOOM_STATUS_COL));
-	dbg("UHARDDOOM_STATUS_FX: %u\n", (status & UHARDDOOM_STATUS_FX));
-	dbg("UHARDDOOM_STATUS_SWR: %u\n", (status & UHARDDOOM_STATUS_SWR));
-	// dbg("UHARDDOOM_STATUS_FIFO_SRDCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDCMD));
-	// dbg("UHARDDOOM_STATUS_FIFO_SPANCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANCMD));
-	// dbg("UHARDDOOM_STATUS_FIFO_COLCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLCMD));
-	// dbg("UHARDDOOM_STATUS_FIFO_FXCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXCMD));
-	// dbg("UHARDDOOM_STATUS_FIFO_SWRCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SWRCMD));
-	// dbg("UHARDDOOM_STATUS_FIFO_COLIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLIN));
-	// dbg("UHARDDOOM_STATUS_FIFO_FXIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXIN));
-	// dbg("UHARDDOOM_STATUS_FIFO_FESEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_FESEM));
-	// dbg("UHARDDOOM_STATUS_FIFO_SRDSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDSEM));
-	// dbg("UHARDDOOM_STATUS_FIFO_COLSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLSEM));
-	// dbg("UHARDDOOM_STATUS_FIFO_SPANSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANSEM));
-	// dbg("UHARDDOOM_STATUS_FIFO_SPANOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANOUT));
-	// dbg("UHARDDOOM_STATUS_FIFO_COLOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLOUT));
-	// dbg("UHARDDOOM_STATUS_FIFO_FXOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXOUT));
+	if (flags & UDOOMDEV_DEBUG_STATUS_BASIC) {
+		dbg("UHARDDOOM_STATUS_BATCH: %u\n", (status & UHARDDOOM_STATUS_BATCH));
+		dbg("UHARDDOOM_STATUS_JOB: %u\n", (status & UHARDDOOM_STATUS_JOB));
+		dbg("UHARDDOOM_STATUS_CMD: %u\n", (status & UHARDDOOM_STATUS_CMD));
+		dbg("UHARDDOOM_STATUS_FE: %u\n", (status & UHARDDOOM_STATUS_FE));
+		dbg("UHARDDOOM_STATUS_SRD: %u\n", (status & UHARDDOOM_STATUS_SRD));
+		dbg("UHARDDOOM_STATUS_SPAN: %u\n", (status & UHARDDOOM_STATUS_SPAN));
+		dbg("UHARDDOOM_STATUS_COL: %u\n", (status & UHARDDOOM_STATUS_COL));
+		dbg("UHARDDOOM_STATUS_FX: %u\n", (status & UHARDDOOM_STATUS_FX));
+		dbg("UHARDDOOM_STATUS_SWR: %u\n", (status & UHARDDOOM_STATUS_SWR));
+	}
 
-	// dbg("UHARDDOOM_STAT_FW_JOB: %u\n", stats[0x00]);
-	// dbg("UHARDDOOM_STAT_FW_CMD: %u\n", stats[0x01]);
-	// dbg("UHARDDOOM_STAT_CMD_BLOCK: %u\n", stats[0x56]);
-	// dbg("UHARDDOOM_STAT_CMD_WORD: %u\n", stats[0x57]);
-	// dbg("UHARDDOOM_STAT_FE_INSN: %u\n", stats[0x58]);
-	// dbg("UHARDDOOM_STAT_FE_LOAD: %u\n", stats[0x59]);
-	// dbg("UHARDDOOM_STAT_FE_STORE: %u\n", stats[0x5a]);
-	// dbg("UHARDDOOM_STAT_MMIO_READ: %u\n", stats[0x5c]);
-	// dbg("UHARDDOOM_STAT_MMIO_WRITE: %u\n", stats[0x5d]);
-	// dbg("UHARDDOOM_STAT_SRD_CMD: %u\n", stats[0x60]);
-	// dbg("UHARDDOOM_STAT_SRD_READ: %u\n", stats[0x61]);
-	// dbg("UHARDDOOM_STAT_SRD_BLOCK: %u\n", stats[0x62]);
-	// dbg("UHARDDOOM_STAT_SRD_FESEM: %u\n", stats[0x63]);
-	// dbg("UHARDDOOM_STAT_SWR_CMD: %u\n", stats[0x78]);
-	// dbg("UHARDDOOM_STAT_SWR_DRAW: %u\n", stats[0x79]);
-	// dbg("UHARDDOOM_STAT_SWR_BLOCK: %u\n", stats[0x7a]);
-	// dbg("UHARDDOOM_STAT_SWR_BLOCK_READ: %u\n", stats[0x7b]);
-	// dbg("UHARDDOOM_STAT_SWR_BLOCK_TRANS: %u\n", stats[0x7c]);
-	// dbg("UHARDDOOM_STAT_SWR_SRDSEM: %u\n", stats[0x7d]);
-	// dbg("UHARDDOOM_STAT_SWR_COLSEM: %u\n", stats[0x7e]);
-	// dbg("UHARDDOOM_STAT_SWR_SPANSEM: %u\n", stats[0x7f]);
+	if (flags & UDOOMDEV_DEBUG_STATUS_FIFO) {
+		dbg("UHARDDOOM_STATUS_FIFO_SRDCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDCMD));
+		dbg("UHARDDOOM_STATUS_FIFO_SPANCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANCMD));
+		dbg("UHARDDOOM_STATUS_FIFO_COLCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLCMD));
+		dbg("UHARDDOOM_STATUS_FIFO_FXCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXCMD));
+		dbg("UHARDDOOM_STATUS_FIFO_SWRCMD: %u\n", (status & UHARDDOOM_STATUS_FIFO_SWRCMD));
+		dbg("UHARDDOOM_STATUS_FIFO_COLIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLIN));
+		dbg("UHARDDOOM_STATUS_FIFO_FXIN: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXIN));
+		dbg("UHARDDOOM_STATUS_FIFO_FESEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_FESEM));
+		dbg("UHARDDOOM_STATUS_FIFO_SRDSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SRDSEM));
+		dbg("UHARDDOOM_STATUS_FIFO_COLSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLSEM));
+		dbg("UHARDDOOM_STATUS_FIFO_SPANSEM: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANSEM));
+		dbg("UHARDDOOM_STATUS_FIFO_SPANOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_SPANOUT));
+		dbg("UHARDDOOM_STATUS_FIFO_COLOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_COLOUT));
+		dbg("UHARDDOOM_STATUS_FIFO_FXOUT: %u\n", (status & UHARDDOOM_STATUS_FIFO_FXOUT));
+	}
+
+	if (flags & UDOOMDEV_DEBUG_STAT_BASIC) {
+		dbg("UHARDDOOM_STAT_FW_JOB: %u\n", stats[0x00]);
+		dbg("UHARDDOOM_STAT_FW_CMD: %u\n", stats[0x01]);
+		dbg("UHARDDOOM_STAT_CMD_BLOCK: %u\n", stats[0x56]);
+		dbg("UHARDDOOM_STAT_CMD_WORD: %u\n", stats[0x57]);
+		dbg("UHARDDOOM_STAT_FE_INSN: %u\n", stats[0x58]);
+		dbg("UHARDDOOM_STAT_FE_LOAD: %u\n", stats[0x59]);
+		dbg("UHARDDOOM_STAT_FE_STORE: %u\n", stats[0x5a]);
+		dbg("UHARDDOOM_STAT_MMIO_READ: %u\n", stats[0x5c]);
+		dbg("UHARDDOOM_STAT_MMIO_WRITE: %u\n", stats[0x5d]);
+		dbg("UHARDDOOM_STAT_SRD_CMD: %u\n", stats[0x60]);
+	}
+
+	if (flags & UDOOMDEV_DEBUG_STAT_EXT) {
+		dbg("UHARDDOOM_STAT_SRD_READ: %u\n", stats[0x61]);
+		dbg("UHARDDOOM_STAT_SRD_BLOCK: %u\n", stats[0x62]);
+		dbg("UHARDDOOM_STAT_SRD_FESEM: %u\n", stats[0x63]);
+		dbg("UHARDDOOM_STAT_SWR_CMD: %u\n", stats[0x78]);
+		dbg("UHARDDOOM_STAT_SWR_DRAW: %u\n", stats[0x79]);
+		dbg("UHARDDOOM_STAT_SWR_BLOCK: %u\n", stats[0x7a]);
+		dbg("UHARDDOOM_STAT_SWR_BLOCK_READ: %u\n", stats[0x7b]);
+		dbg("UHARDDOOM_STAT_SWR_BLOCK_TRANS: %u\n", stats[0x7c]);
+		dbg("UHARDDOOM_STAT_SWR_SRDSEM: %u\n", stats[0x7d]);
+		dbg("UHARDDOOM_STAT_SWR_COLSEM: %u\n", stats[0x7e]);
+		dbg("UHARDDOOM_STAT_SWR_SPANSEM: %u\n", stats[0x7f]);
+	}
 
 }
