@@ -89,7 +89,7 @@ struct AddressSpace {
 	struct DeviceCtx* dev;
 	struct list_head list_node; // DeviceCtx.contexts
 	struct file* file;
-	bool broken;
+	volatile bool broken;
 
 	struct mutex buffers_mutex;
 	struct list_head buffers; // struct Buffer
@@ -144,7 +144,7 @@ static struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev);
 static int dev_init_pci(struct DeviceCtx* dev);
 static int dev_init_dma(struct DeviceCtx* dev);
 static int dev_init_irq(struct DeviceCtx* dev);
-static int dev_init_hardware(struct DeviceCtx* dev);
+static int dev_init_hardware(struct DeviceCtx* dev, bool load_fw);
 static int dev_init_chardev(struct DeviceCtx* dev);
 static void dev_dbg_status(struct DeviceCtx* dev, uint32_t flags);
 
@@ -185,11 +185,11 @@ dev_addr_t page_tab_beg(size_t dir_idx, size_t tab_idx) {
 }
 
 bool page_dir_is_present(page_dir_entry_t entry) {
-	return (entry.value & 0x1) != 0;
+	return (__le32_to_cpu(entry.value) & 0x1) != 0;
 }
 
 dma_addr_t page_dir_tab_addr(page_dir_entry_t entry) {
-	return (dma_addr_t) ((entry.value >> 4) << PAGE_SHIFT);
+	return (dma_addr_t) ((__le32_to_cpu(entry.value) >> 4) << PAGE_SHIFT);
 }
 
 size_t page_dir_index(dev_addr_t dev_addr) {
@@ -206,25 +206,25 @@ size_t page_offset(dev_addr_t dev_addr) {
 
 page_dir_entry_t page_dir_make(dma_addr_t page_tab_addr) {
 	return (page_dir_entry_t) {
-		.value = (page_tab_addr >> 8) | 0x1
+		.value = __cpu_to_le32((page_tab_addr >> 8) | 0x1)
 	};
 }
 
 bool page_tab_is_present(page_tab_entry_t entry) {
-	return (entry.value & 0x1) != 0;
+	return (__le32_to_cpu(entry.value) & 0x1) != 0;
 }
 
 bool page_tab_is_writable(page_tab_entry_t entry) {
-	return (entry.value & 0x2) != 0;
+	return (__le32_to_cpu(entry.value) & 0x2) != 0;
 }
 
 dma_addr_t page_tab_dma_addr(page_tab_entry_t entry) {
-	return (dma_addr_t) ((entry.value >> 4) << PAGE_SHIFT);
+	return (dma_addr_t) ((__le32_to_cpu(entry.value) >> 4) << PAGE_SHIFT);
 }
 
 page_tab_entry_t page_tab_make(dma_addr_t dma_addr, bool writable) {
 	return (page_tab_entry_t) {
-		.value = (dma_addr >> 8) | (writable ? 0x2 : 0) | 0x1
+		.value = __cpu_to_le32((dma_addr >> 8) | (writable ? 0x2 : 0) | 0x1)
 	};
 }
 
@@ -454,12 +454,14 @@ out:
 	return error;
 }
 
-static int dev_init_hardware(struct DeviceCtx* dev)
+static int dev_init_hardware(struct DeviceCtx* dev, bool load_fw)
 {
 	size_t i;
-	W(UHARDDOOM_FE_CODE_ADDR, 0);
-	for (i = 0; i < ARRAY_SIZE(udoomfw); ++i) {
-		W(UHARDDOOM_FE_CODE_WINDOW, udoomfw[i]);
+	if (load_fw) {
+		W(UHARDDOOM_FE_CODE_ADDR, 0);
+		for (i = 0; i < ARRAY_SIZE(udoomfw); ++i) {
+			W(UHARDDOOM_FE_CODE_WINDOW, udoomfw[i]);
+		}
 	}
 	W(UHARDDOOM_RESET, UHARDDOOM_RESET_ALL);
 	W(UHARDDOOM_INTR, UHARDDOOM_INTR_MASK);
@@ -514,19 +516,33 @@ out:
 	return error;
 }
 
+struct AddressSpace* dev_get_ctx(struct DeviceCtx* dev)
+{
+	struct AddressSpace* ctx = NULL;
+	dma_addr_t pgd_dma = R(UHARDDOOM_TLB_USER_PDP) << 12;
+
+	list_for_each_entry(ctx, &dev->contexts, list_node) {
+		if (ctx->pgd_dma == pgd_dma) {
+			return ctx;
+		}
+	}
+	BUG();
+}
+
 // TODO
 irqreturn_t dev_handle_irq(int irq, void* opaque)
 {
 	struct DeviceCtx* dev = (struct DeviceCtx*) opaque;
 	uint32_t intr = 0;
 	uint32_t done = 0;
+	uint32_t fe_code = 0, fe_a = 0, fe_b = 0;
 	int i = 0;
 
 	// Semaphore must be down here.
+	// If we succeed to take lock, something is wrong.
 	BUG_ON(down_trylock(&dev->free) == 0);
 
 	intr = R(UHARDDOOM_INTR);
-	done = 0;
 
 	if (intr & UHARDDOOM_INTR_JOB_DONE) {
 		dbg("irq: job done\n");
@@ -534,27 +550,40 @@ irqreturn_t dev_handle_irq(int irq, void* opaque)
 	}
 
 	if (intr & UHARDDOOM_INTR_FE_ERROR) {
-		dbg("irq: fe error\n");
+		fe_code = R(UHARDDOOM_FE_ERROR_CODE);
+		fe_a = R(UHARDDOOM_FE_ERROR_DATA_A);
+		fe_b = R(UHARDDOOM_FE_ERROR_DATA_B);
+		dbg("irq: fe error: code=%x a=%x b=%x\n", fe_code, fe_a, fe_b);
+
+		dev_get_ctx(dev)->broken = true;
+		dev_init_hardware(dev, false);
 		done |= UHARDDOOM_INTR_FE_ERROR;
 	}
 
 	if (intr & UHARDDOOM_INTR_CMD_ERROR) {
 		dbg("irq: cmd error\n");
+
+		dev_get_ctx(dev)->broken = true;
+		dev_init_hardware(dev, false);
 		done |= UHARDDOOM_INTR_CMD_ERROR;
 	}
 
 	for (; i < 8; ++i) {
 		if (intr & UHARDDOOM_INTR_PAGE_FAULT(i)) {
 			dbg("irq: page fault %d\n", i);
+
+			dev_get_ctx(dev)->broken = true;
+			dev_init_hardware(dev, false);
 			done |= UHARDDOOM_INTR_PAGE_FAULT(i);
 		}
 	}
 
-	W(UHARDDOOM_INTR, done);
-	
 	// Any interrupt implies that device is now free.
-	up(&dev->free);
-	return IRQ_HANDLED;
+	if (done != 0) {
+		W(UHARDDOOM_INTR, done);
+		up(&dev->free);
+	}
+	return IRQ_RETVAL(done);
 }
 
 // Always called from process context, so it can sleep.
@@ -583,7 +612,7 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 		goto err;
 	}
 
-	err = dev_init_hardware(dev);
+	err = dev_init_hardware(dev, true);
 	if (err) {
 		goto err;
 	}
@@ -824,7 +853,7 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 	}
 	buff->filp = fd.file;
 	fdput(fd);
-	
+
 	buff->ctx = ctx;
 	buff->size = cmd->size;
 	INIT_LIST_HEAD(&buff->list_node);
@@ -1053,7 +1082,7 @@ static void ctx_unmap_area(struct AddressSpace* ctx, struct VirtArea* area)
 		tab_idx = page_tab_index(area->beg + offset);
 
 		if (ctx->pgts[dir_idx] != NULL) {
-			ctx->pgts[dir_idx]->entry[tab_idx].value = 0U;
+			ctx->pgts[dir_idx]->entry[tab_idx].value = __cpu_to_le32(0);
 		}
 	}
 }
