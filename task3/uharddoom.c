@@ -101,6 +101,11 @@ struct AddressSpace {
 	dma_addr_t pgd_dma;
 };
 
+struct BufferPage {
+	void* hst_addr;
+	dma_addr_t dma_addr;
+};
+
 struct Buffer {
 	struct AddressSpace* ctx;
 	struct list_head list_node; // AddressSpace.buffers
@@ -108,8 +113,7 @@ struct Buffer {
 	int fd; // debug
 
 	uint32_t size;
-	void* hst_addr;
-	dma_addr_t dma_addr;
+	struct BufferPage* pages; // array of pages with count determined by buffer size
 };
 
 struct VirtArea {
@@ -270,7 +274,6 @@ struct file_operations buffer_api = {
 	.owner = THIS_MODULE,
 	.release = buffer_release,
 	.mmap = buffer_mmap,
-	.mmap_supported_flags = MAP_SHARED
 };
 
 struct vm_operations_struct buffer_vm_api = {
@@ -538,10 +541,6 @@ irqreturn_t dev_handle_irq(int irq, void* opaque)
 	uint32_t fe_code = 0, fe_a = 0, fe_b = 0;
 	int i = 0;
 
-	// Semaphore must be down here.
-	// If we succeed to take lock, something is wrong.
-	BUG_ON(down_trylock(&dev->free) == 0);
-
 	intr = R(UHARDDOOM_INTR);
 
 	if (intr & UHARDDOOM_INTR_JOB_DONE) {
@@ -592,7 +591,7 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 	struct DeviceCtx* dev = NULL;
 	int err = 0;
 
-	dbg("device [%zd] probe beg\n", dev->index);
+	dbg("device probe beg\n");
 	
 	// Alloc DeviceCtx, init trivial fields
 	dev = dev_alloc(pci_dev);
@@ -601,7 +600,7 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 		dev = NULL;
 		goto err;
 	}
-
+	
 	err = dev_init_pci(dev);
 	if (err) {
 		goto err;
@@ -818,6 +817,7 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 	struct Buffer* buff = NULL;
 	struct fd fd;
 	long err = 0;
+	size_t i = 0;
 	
 	// struct Buffer
 	buff = kzalloc(sizeof(*buff), GFP_KERNEL);
@@ -826,16 +826,28 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 		cry(kzalloc, err);
 		goto err;
 	}
-	
-	// Physical memory
-	buff->hst_addr = dma_alloc_coherent(&dev->pci_dev->dev, cmd->size, &buff->dma_addr, GFP_KERNEL);
-	if (IS_ERR_OR_NULL(buff->hst_addr)) {
+
+	// Page array
+	buff->pages = kzalloc(page_cnt(cmd->size) * sizeof(struct BufferPage), GFP_KERNEL);
+	if (buff->pages == NULL) {
 		err = -ENOMEM;
-		buff->hst_addr = NULL;
-		cry(dma_alloc_coherent, err);
+		cry(kzalloc, err);
 		goto err;
 	}
 
+	// Physical memory
+	for (i = 0; i < page_cnt(cmd->size); ++i) {
+		buff->pages[i].hst_addr = dma_alloc_coherent(
+			&dev->pci_dev->dev, PAGE_SIZE, &buff->pages[i].dma_addr, GFP_KERNEL
+		);
+		if (IS_ERR_OR_NULL(buff->pages[i].hst_addr)) {
+			buff->pages[i].hst_addr = NULL;
+			err = -ENOMEM;
+			cry(dma_alloc_coherent, err);
+			goto err;
+		}
+	}
+	
 	// Get fd, set private_data
 	buff->fd = anon_inode_getfd(THIS_MODULE->name, &buffer_api, buff, O_RDWR);
 	if (IS_ERR_VALUE((long) buff->fd)) {
@@ -866,7 +878,7 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 	list_add(&buff->list_node, &ctx->buffers);
 	mutex_unlock(&ctx->buffers_mutex);
 
-	return err;
+	return buff->fd;
 err:
 	if (buff != NULL) {
 		buffer_drop(buff);
@@ -968,17 +980,16 @@ static long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
 {
 	struct PageTab* page_tab = NULL;
 	dma_addr_t page_tab_dma = 0;
-	size_t offset = 0;
+	size_t page_idx = 0;
 	size_t dir_idx = 0;
 	size_t tab_idx = 0;
 	long err = 0;
 	BUG_ON(page_offset(area->beg) != 0);
 
 	dbg("map_area: area: (%x, %x) w=%u\n", area->beg, area->end, area->writable);
-	for (; offset < area->buffer->size; offset += PAGE_SIZE) {
-		dir_idx = page_dir_index(area->beg + offset);
-		tab_idx = page_tab_index(area->beg + offset);
-		dbg("map_area: updating dir_idx=%zu tab_idx=%zu\n", dir_idx, tab_idx);
+	for (; page_idx < page_cnt(area->buffer->size); page_idx += 1) {
+		dir_idx = page_dir_index(area->beg + page_idx * PAGE_SIZE);
+		tab_idx = page_tab_index(area->beg + page_idx * PAGE_SIZE);
 
 		// make sure page table is present:
 		if (ctx->pgts[dir_idx] == NULL) {
@@ -992,7 +1003,8 @@ static long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
 			ctx->pgts[dir_idx] = page_tab;
 			ctx->pgd->entry[dir_idx] = page_dir_make(page_tab_dma);
 		}
-		ctx->pgts[dir_idx]->entry[tab_idx] = page_tab_make(area->buffer->dma_addr + offset, area->writable);
+		dbg("map_area: updating dir_idx=%zu tab_idx=%zu\n", dir_idx, tab_idx);
+		ctx->pgts[dir_idx]->entry[tab_idx] = page_tab_make(area->buffer->pages[page_idx].dma_addr, area->writable);
 	}
 	return 0;
 
@@ -1045,6 +1057,8 @@ long ctx_ioctl_unmap_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, str
 	dev_addr_t addr = cmd->addr;
 	long err = 0;
 
+	dbg("unmap_buffer: entry\n");
+
 	if (down_interruptible(&dev->free)) {
 		return -ERESTARTSYS;
 	}
@@ -1064,9 +1078,11 @@ long ctx_ioctl_unmap_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, str
 		}
 	}
 	err = -ENOENT;
+	dbg("unmap_buffer: err\n");
 
 done:
 	up(&dev->free);
+	dbg("unmap_buffer: done\n");
 	return err;
 }
 
@@ -1089,11 +1105,16 @@ static void ctx_unmap_area(struct AddressSpace* ctx, struct VirtArea* area)
 
 static void buffer_drop(struct Buffer *buff)
 {
+	size_t i = 0;
+	dbg("buffer_drop: entry\n");
 	// Free underlying memory
-	if (buff->hst_addr != NULL) {
-		dma_free_coherent(&buff->ctx->dev->pci_dev->dev, 
-			buff->size, buff->hst_addr, buff->dma_addr
-		);
+	if (buff->pages != NULL) {
+		for (i = 0; i < page_cnt(buff->size); i++) {
+			dma_free_coherent(&buff->ctx->dev->pci_dev->dev, 
+				PAGE_SIZE, buff->pages[i].hst_addr, buff->pages[i].dma_addr
+			);
+		}
+		kfree(buff->pages);
 	}
 
 	// Remove buff from context's list of buffers
@@ -1103,16 +1124,18 @@ static void buffer_drop(struct Buffer *buff)
 		mutex_unlock(&buff->ctx->buffers_mutex);
 	}
 	kfree(buff);
+	dbg("buffer_drop: done\n");
 
 }
 
 long ctx_ioctl_run(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd)
 {
+	dbg("run: entry\n");
 	if (!IS_ALIGNED(cmd->addr, 4) || !IS_ALIGNED(cmd->size, 4)) {
 		return -EINVAL;
 	}
 
-		if (down_interruptible(&dev->free)) {
+	if (down_interruptible(&dev->free)) {
 		return -ERESTARTSYS;
 	}
 
@@ -1120,6 +1143,8 @@ long ctx_ioctl_run(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoom
 		up(&dev->free);
 		return -EIO;
 	}
+	
+	dbg("run: trig\n");
 
 	W(UHARDDOOM_JOB_PDP, (ctx->pgd_dma >> 12));
 	W(UHARDDOOM_JOB_CMD_PTR, cmd->addr);
@@ -1127,11 +1152,13 @@ long ctx_ioctl_run(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoom
 	W(UHARDDOOM_JOB_TRIGGER, 1);
 
 	// up(&dev->free) is done in irq handler.
+	dbg("run: exit\n");
 	return 0;
 }
 
 long ctx_ioctl_wait(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd)
 {
+	dbg("wait: entry\n");
 	// Since ioctl_run is synchronous, there can be max 1 pending task
 	if (cmd->num_back >= 1) {
 		return 0;
@@ -1145,7 +1172,9 @@ long ctx_ioctl_wait(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoo
 		up(&dev->free);
 		return -EIO;
 	}
+	
 	up(&dev->free);
+	dbg("wait: exit\n");
 	return 0;
 }
 
@@ -1201,9 +1230,7 @@ int buffer_release(struct inode* inode, struct file* filp)
 
 int buffer_mmap(struct file* filp, struct vm_area_struct* vma)
 {
-	dbg("mmap start\n");
 	vma->vm_ops = &buffer_vm_api;
-	dbg("mmap end\n");
 	return 0; 
 }
 
@@ -1212,12 +1239,15 @@ vm_fault_t buffer_fault(struct vm_fault *vmf)
 	struct file* filp = vmf->vma->vm_file;
 	struct Buffer* buff = filp->private_data;
 
+	dbg("buffer_fault: entry\n");
+
 	if (vmf->pgoff >= page_cnt(buff->size)) {
 		dbg("buffer_fault: out of bounds\n");
 		return VM_FAULT_SIGBUS;
 	}
-	vmf->page = virt_to_page(buff->hst_addr + PAGE_SIZE * vmf->pgoff);
+	vmf->page = virt_to_page(buff->pages[vmf->pgoff].hst_addr);
 	get_page(vmf->page);
+	dbg("buffer_fault: done\n");
 	return 0;
 }
 
@@ -1321,8 +1351,8 @@ void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
 
 	print("Buffers:\n");
 	list_for_each_entry(buff, &ctx->buffers, list_node) {
-		print("[%d] sz=(0x%x, %u) hst=%px dma=%llx\n",
-			buff->fd, buff->size, buff->size, buff->hst_addr, buff->dma_addr
+		print("[%d] sz=(0x%x, %u)\n",
+			buff->fd, buff->size, buff->size
 		);
 	}
 	print("\n");
