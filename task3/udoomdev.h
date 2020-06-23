@@ -55,6 +55,7 @@ struct udoomdev_ioctl_debug {
 #define UDOOMDEV_DEBUG_STAT_BASIC 0x4
 #define UDOOMDEV_DEBUG_STAT_EXT 0x8
 #define UDOOMDEV_DEBUG_VMEM 0x10
+#define UDOOMDEV_DEBUG_INTERNAL 0x20
 
 #define UDOOMDEV_DEBUG_BUFFER_SIZE (1 << 20)
 

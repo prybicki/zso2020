@@ -16,14 +16,11 @@
 #include "udoomfw.h"
 #include "udoomdev.h"
 
-// QUESTION Czy potrzebujemy używać jakichś mem-fence podczas startu urządzenia?
-//          Np. po wgraniu firmware.
-
 ///////////////////////////////////////////////////////////////////////////////
 // Assumptions & decisions
 /*
 - Buffer's file private data = Buffer*
-- *_drop function only deals with memory, not semantics (use release)
+- *_free function only deals with memory, not semantics (use release)
 
 Remove shit like (?):
 mem = alloc()
@@ -776,43 +773,68 @@ err:
 	return err;
 }
 
-// TODO finish this
-static void ctx_free(struct DeviceCtx *dev, struct AddressSpace *ctx)
+size_t list_size(struct list_head* head)
 {
-	// struct VirtArea *area = NULL, *tmp_area = NULL;	
-	// struct Buffer *buff = NULL, *tmp_buff = NULL;
-	// size_t i = 0;
-
-
-	// // Remove from the device's list of contexts
-	// if (!list_empty(&ctx->list_node)) {
-	// 	mutex_lock(&dev->contexts_mutex);
-	// 	list_del(&ctx->list_node);
-	// 	mutex_unlock(&dev->contexts_mutex);
-	// }
-
-	// // list_for_each_entry_safe(area, )
-
-	// // Free page tables
-	// if (ctx->pgd != NULL) {
-	// 	for (i = 0; i < PAGE_ENTRIES; ++i) {
-	// 		if (ctx->pgts[i] != NULL) {
-	// 			dma_free_coherent(&dev->pci_dev->dev, sizeof(*ctx->pgts[i]), 
-	// 				ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
-	// 			);
-	// 		}
-	// 	}
-	// 	dma_free_coherent(&dev->pci_dev->dev, sizeof(*ctx->pgd), 
-	// 				ctx->pgd, ctx->pgd_dma
-	// 	);
-	// }
-
+	struct list_head* pos = NULL;
+	size_t cnt = 0;
+	list_for_each(pos, head) {
+		cnt +=1 ;
+	}
+	return cnt;
 }
 
 int ctx_release(struct inode *inode, struct file *file)
 {
-	// TODO cleanup
-	return -EIO;
+	struct AddressSpace* ctx = file->private_data;
+	struct DeviceCtx* dev = ctx->dev;
+	struct VirtArea* area = NULL, *tmp_area = NULL;
+	struct Buffer* buff = 0, *tmp_buff = NULL;
+	size_t i = 0;
+
+	dbg("ctx_release: entry\n");
+
+	// guarantees that device is not using mappings we're about to free
+	down(&ctx->dev->free);
+
+	list_for_each_entry_safe(area, tmp_area, &ctx->areas, list_node) {
+		fput(area->buffer->filp); // AFAIU this will trigger buffer_release
+		list_del(&area->list_node);
+		kfree(area);
+	}
+
+	// There should be not buffers at this point
+	// because ctx->file refcount must be zero at this point
+	// and every buffer increments it by 1.
+	list_for_each_entry_safe(buff, tmp_buff, &ctx->buffers, list_node) {
+		printk(KERN_WARNING "ctx_release: WARNING: releasing orphaned buffer! (?)\n");
+		buffer_drop(buff); // locks and removes it from ctx.buffers
+	}
+
+	// Free page tables
+	if (ctx->pgd != NULL) {
+		for (i = 0; i < PAGE_ENTRIES; ++i) {
+			if (ctx->pgts[i] != NULL) {
+				dma_free_coherent(&dev->pci_dev->dev, sizeof(*ctx->pgts[i]), 
+					ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
+				);
+			}
+		}
+		dma_free_coherent(&dev->pci_dev->dev, sizeof(*ctx->pgd), 
+					ctx->pgd, ctx->pgd_dma
+		);
+	}
+
+	// Remove from the device's list of contexts
+	if (!list_empty(&ctx->list_node)) {
+		mutex_lock(&dev->contexts_mutex);
+		list_del(&ctx->list_node);
+		mutex_unlock(&dev->contexts_mutex);
+	}
+	up(&ctx->dev->free);
+	kfree(ctx);
+
+	dbg("ctx_release: done\n");
+	return 0;
 }
 
 long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, struct udoomdev_ioctl_create_buffer* cmd)
@@ -882,6 +904,8 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 		err = -ERESTARTSYS;
 		goto err;
 	}
+
+	get_file(ctx->file); // inc context refcount
 	list_add(&buff->list_node, &ctx->buffers);
 	mutex_unlock(&ctx->buffers_mutex);
 
@@ -966,7 +990,7 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struc
 	if (IS_ERR_VALUE(status)) {
 		goto err;
 	}
-	get_file(fd.file); // inc refcount
+	get_file(buff->filp); // inc buffer refcount
 	
 	list_add(&area->list_node, pred_head);
 	
@@ -1133,6 +1157,7 @@ static void buffer_drop(struct Buffer *buff)
 		list_del(&buff->list_node);
 		mutex_unlock(&buff->ctx->buffers_mutex);
 	}
+	fput(buff->ctx->file); // dec refcount
 	kfree(buff);
 	dbg("buffer_drop: done\n");
 
@@ -1341,10 +1366,48 @@ void dev_dbg_status(struct DeviceCtx* dev, unsigned flags)
 
 }
 
+static void _ctx_dbg(struct DeviceCtx* dev, struct AddressSpace* ctx)
+{
+	struct Buffer* buff = NULL;
+	struct VirtArea* area = NULL;
+
+	dbg("context:\n");
+	list_for_each_entry(buff, &ctx->buffers, list_node) {
+		dbg("buffer: %d sz=0x%x\n", buff->fd, buff->size);
+	}
+	list_for_each_entry(area, &ctx->areas, list_node) {
+		dbg("area: (0x%x, 0x%x), buff=%d\n", area->beg, area->end, area->buffer->fd);
+	}
+}
+
+static void _dev_dbg(struct DeviceCtx* dev) {
+	struct AddressSpace* ctx = NULL;
+	
+	dbg("device:\n");
+	list_for_each_entry(ctx, &dev->contexts, list_node) {
+		_ctx_dbg(dev, ctx);
+	}
+}
+
+static void _drv_dbg(void) 
+{
+	size_t d = 0;
+	for (d = 0; d < MAX_DEVICE_COUNT; d++) {
+		if (devices[d] != NULL) {
+			_dev_dbg(devices[d]);
+			dbg("\n");
+		}
+	}
+	dbg("--- --- ---\n");
+}
+
 long ctx_ioctl_debug(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
 {
 	if (cmd->flags & UDOOMDEV_DEBUG_VMEM) {
 		ctx_dbg_vmem(ctx, cmd);
+	}
+	if (cmd->flags & UDOOMDEV_DEBUG_INTERNAL) {
+		_drv_dbg();
 	}
 	dev_dbg_status(dev, cmd->flags);
 	return 0;
