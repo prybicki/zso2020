@@ -104,8 +104,8 @@ struct AddressSpace {
 struct Buffer {
 	struct AddressSpace* ctx;
 	struct list_head list_node; // AddressSpace.buffers
-	size_t refcount; // references stored in VirtArea
-	int fd;
+	struct file* filp;
+	int fd; // debug
 
 	uint32_t size;
 	void* hst_addr;
@@ -128,20 +128,6 @@ struct VirtArea {
 #define cry(fn, value) dbg("%s(...) failed with %lld\n", #fn, (long long) value)
 #define W(reg, data) iowrite32(data, (void*) (((char*) dev->iomem) + reg))
 #define R(reg) ioread32((void*) (((char*) dev->iomem) + reg))
-
-#define lock_dev_chk_ctx() \
-	if (down_interruptible(&dev->free)) {\
-		err = -ERESTARTSYS;\
-		goto err;\
-	}\
-	if (ctx->broken) {\
-		up(&dev->free);\
-		err = -EIO;\
-		goto err;\
-	}\
-
-#define unlock_dev() \
-	up(&dev->free);
 
 int drv_initialize(void);
 void drv_terminate(void);
@@ -175,12 +161,13 @@ static void ctx_free(struct DeviceCtx *dev, struct AddressSpace *ctx);
 static long ctx_ioctl_debug(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
 static bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos);
 static long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area);
+static void ctx_unmap_area(struct AddressSpace* ctx, struct VirtArea* area);
 static void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
 
 int buffer_release(struct inode *, struct file *);
 int buffer_mmap(struct file *, struct vm_area_struct *);
 vm_fault_t buffer_fault(struct vm_fault *vmf);
-void buffer_free(struct Buffer* buff);
+static void buffer_drop(struct Buffer *buff);
 
 ///////////////////////////////////////////////////////////////////////////////
 // Oneliners
@@ -800,6 +787,7 @@ int ctx_release(struct inode *inode, struct file *file)
 long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, struct udoomdev_ioctl_create_buffer* cmd)
 {
 	struct Buffer* buff = NULL;
+	struct fd fd;
 	long err = 0;
 	
 	// struct Buffer
@@ -828,6 +816,15 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 		goto err;
 	}
 
+	fd = fdget(buff->fd);
+	if (fd.file == NULL) {
+		err = -EBADF; // This should not happen, maybe BUG_ON would be better.
+		cry(fdget, err);
+		goto err;
+	}
+	buff->filp = fd.file;
+	fdput(fd);
+	
 	buff->ctx = ctx;
 	buff->size = cmd->size;
 	INIT_LIST_HEAD(&buff->list_node);
@@ -843,27 +840,9 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 	return err;
 err:
 	if (buff != NULL) {
-		buffer_free(buff);
+		buffer_drop(buff);
 	}
 	return err;
-}
-
-void buffer_free(struct Buffer* buff) {
-	BUG_ON(buff->refcount > 0);
-
-	// Free underlying memory
-	if (buff->hst_addr) {
-		dma_free_coherent(&buff->ctx->dev->pci_dev->dev, 
-			buff->size, buff->hst_addr, buff->dma_addr
-		);
-	}
-
-	// Remove buff from context's list of buffers
-	if (!list_empty(&buff->list_node)) {
-		mutex_lock(&buff->ctx->buffers_mutex);
-		list_del(&buff->list_node);
-		mutex_unlock(&buff->ctx->buffers_mutex);
-	}
 }
 
 long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_map_buffer *cmd)
@@ -876,7 +855,14 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struc
 	long err = 0;
 	struct fd fd = {0};
 
-	lock_dev_chk_ctx();
+	if (down_interruptible(&dev->free)) {
+		return -ERESTARTSYS;
+	}
+
+	if (ctx->broken) {
+		up(&dev->free);
+		return -EIO;
+	}
 
 	fd = fdget(cmd->buf_fd);
 	if (fd.file == NULL) {
@@ -931,10 +917,7 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struc
 	if (IS_ERR_VALUE(err)) {
 		goto err;
 	}
-	buff->refcount += 1;
-	
-	// TODO TLB
-
+	get_file(fd.file); // inc refcount
 	list_add(&area->list_node, pred_head);
 	goto out;
 
@@ -946,8 +929,9 @@ err:
 		kfree(area);
 	}
 out:
+	BUG_ON(err);
 	fdput(fd);
-	unlock_dev();
+	up(&dev->free);
 	return err;
 }
 
@@ -985,14 +969,7 @@ static long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
 
 err:
 	// Do not deallocate PageTabs, just zero already allocated entries.
-	for (; offset < area->buffer->size; offset += PAGE_SIZE) {
-		dir_idx = page_dir_index(area->beg + offset);
-		tab_idx = page_tab_index(area->beg + offset);
-
-		if (ctx->pgts[dir_idx] != NULL) {
-			ctx->pgts[dir_idx]->entry[tab_idx].value = 0U;
-		}
-	}
+	ctx_unmap_area(ctx, area);
 	return err;
 }
 
@@ -1035,19 +1012,85 @@ bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, 
 
 long ctx_ioctl_unmap_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd)
 {
-	return -EIO;
+	struct VirtArea *area = NULL, *tmp = NULL;
+	dev_addr_t addr = cmd->addr;
+	long err = 0;
+
+	if (down_interruptible(&dev->free)) {
+		return -ERESTARTSYS;
+	}
+
+	if (ctx->broken) {
+		up(&dev->free);
+		return -EIO;
+	}
+	
+	list_for_each_entry_safe(area, tmp, &ctx->areas, list_node) {
+		if (area->beg == addr) {
+			ctx_unmap_area(ctx, area);
+			fput(area->buffer->filp);
+			list_del(&area->list_node);
+			kfree(area);
+			goto done;
+		}
+	}
+	err = -ENOENT;
+
+done:
+	up(&dev->free);
+	return err;
+}
+
+// This does not remove Virt Area and does not affect buffer.
+static void ctx_unmap_area(struct AddressSpace* ctx, struct VirtArea* area)
+{
+	size_t dir_idx = 0;
+	size_t tab_idx = 0;
+	size_t offset = 0;
+
+	for (; offset < area->buffer->size; offset += PAGE_SIZE) {
+		dir_idx = page_dir_index(area->beg + offset);
+		tab_idx = page_tab_index(area->beg + offset);
+
+		if (ctx->pgts[dir_idx] != NULL) {
+			ctx->pgts[dir_idx]->entry[tab_idx].value = 0U;
+		}
+	}
+}
+
+static void buffer_drop(struct Buffer *buff)
+{
+	// Free underlying memory
+	if (buff->hst_addr != NULL) {
+		dma_free_coherent(&buff->ctx->dev->pci_dev->dev, 
+			buff->size, buff->hst_addr, buff->dma_addr
+		);
+	}
+
+	// Remove buff from context's list of buffers
+	if (!list_empty(&buff->list_node)) {
+		mutex_lock(&buff->ctx->buffers_mutex);
+		list_del(&buff->list_node);
+		mutex_unlock(&buff->ctx->buffers_mutex);
+	}
+	kfree(buff);
+
 }
 
 long ctx_ioctl_run(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd)
 {
-	long err = 0;
-
-	if (cmd->addr % 4 != 0 || cmd->size % 4 != 0) {
-		err = -EINVAL;
-		goto err;
+	if (!IS_ALIGNED(cmd->addr, 4) || !IS_ALIGNED(cmd->size, 4)) {
+		return -EINVAL;
 	}
 
-	lock_dev_chk_ctx();
+		if (down_interruptible(&dev->free)) {
+		return -ERESTARTSYS;
+	}
+
+	if (ctx->broken) {
+		up(&dev->free);
+		return -EIO;
+	}
 
 	W(UHARDDOOM_JOB_PDP, (ctx->pgd_dma >> 12));
 	W(UHARDDOOM_JOB_CMD_PTR, cmd->addr);
@@ -1056,24 +1099,25 @@ long ctx_ioctl_run(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoom
 
 	// up(&dev->free) is done in irq handler.
 	return 0;
-err:
-	return err;
 }
 
 long ctx_ioctl_wait(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd)
 {
-	long err = 0;
-
 	// Since ioctl_run is synchronous, there can be max 1 pending task
 	if (cmd->num_back >= 1) {
 		return 0;
 	}
 
-	lock_dev_chk_ctx();
-	unlock_dev();
+	if (down_interruptible(&dev->free)) {
+		return -ERESTARTSYS;
+	}
+
+	if (ctx->broken) {
+		up(&dev->free);
+		return -EIO;
+	}
+	up(&dev->free);
 	return 0;
-err:
-	return err;
 }
 
 long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
@@ -1121,7 +1165,9 @@ long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 
 int buffer_release(struct inode* inode, struct file* filp)
 {
-	return -EIO;
+	struct Buffer *buff = filp->private_data;
+	buffer_drop(buff);
+	return 0;
 }
 
 int buffer_mmap(struct file* filp, struct vm_area_struct* vma)
