@@ -128,7 +128,8 @@ struct VirtArea {
 ///////////////////////////////////////////////////////////////////////////////
 // Callable
 
-#define dbg(fmt, ...) printk(KERN_NOTICE "uharddoom@%03d: " fmt, __LINE__, ##__VA_ARGS__)
+// #define dbg(fmt, ...) printk(KERN_NOTICE "uharddoom@%03d: " fmt, __LINE__, ##__VA_ARGS__)
+#define dbg(...)
 #define cry(fn, value) dbg("%s(...) failed with %lld\n", #fn, (long long) value)
 #define W(reg, data) iowrite32(data, (void*) (((char*) dev->iomem) + reg))
 #define R(reg) ioread32((void*) (((char*) dev->iomem) + reg))
@@ -376,7 +377,7 @@ static struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev)
 	}
 
 	status = kzalloc(sizeof(*status), GFP_KERNEL);
-	if (status == NULL) {
+	if (IS_ERR_OR_NULL(status)) {
 		status = ERR_PTR(-ENOMEM);
 		cry(dev_alloc, status);
 		goto out;
@@ -539,6 +540,7 @@ irqreturn_t dev_handle_irq(int irq, void* opaque)
 	uint32_t intr = 0;
 	uint32_t done = 0;
 	uint32_t fe_code = 0, fe_a = 0, fe_b = 0;
+	uint32_t pf_addr = 0;
 	int i = 0;
 
 	intr = R(UHARDDOOM_INTR);
@@ -552,7 +554,7 @@ irqreturn_t dev_handle_irq(int irq, void* opaque)
 		fe_code = R(UHARDDOOM_FE_ERROR_CODE);
 		fe_a = R(UHARDDOOM_FE_ERROR_DATA_A);
 		fe_b = R(UHARDDOOM_FE_ERROR_DATA_B);
-		dbg("irq: fe error: code=%x a=%x b=%x\n", fe_code, fe_a, fe_b);
+		dbg("irq: fe error: code=0x%x a=0x%x b=0x%x\n", fe_code, fe_a, fe_b);
 
 		dev_get_ctx(dev)->broken = true;
 		dev_init_hardware(dev, false);
@@ -569,7 +571,8 @@ irqreturn_t dev_handle_irq(int irq, void* opaque)
 
 	for (; i < 8; ++i) {
 		if (intr & UHARDDOOM_INTR_PAGE_FAULT(i)) {
-			dbg("irq: page fault %d\n", i);
+			pf_addr = R(UHARDDOOM_TLB_CLIENT_VA(i));
+			dbg("irq: page fault %d at addr: 0x%x\n", i, pf_addr);
 
 			dev_get_ctx(dev)->broken = true;
 			dev_init_hardware(dev, false);
@@ -647,7 +650,7 @@ err:
 void dev_remove(struct pci_dev *pci)
 {
 	struct DeviceCtx* dev = pci_get_drvdata(pci);
-	BUG_ON(dev == NULL);
+	BUG_ON(IS_ERR_OR_NULL(dev));
 
 	// TODO finish tasks..
 	// Think of some locking here
@@ -728,7 +731,7 @@ int ctx_open(struct inode *inode, struct file *file)
 
 	// struct AddressSpace
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (ctx == NULL) {
+	if (IS_ERR_OR_NULL(ctx)) {
 		err = -ENOMEM;
 		cry(kzalloc, err);
 		goto err;
@@ -736,7 +739,7 @@ int ctx_open(struct inode *inode, struct file *file)
 
 	// alloc PageDirectory
 	ctx->pgd = dma_alloc_coherent(&dev->pci_dev->dev, sizeof(*ctx->pgd), &ctx->pgd_dma, GFP_KERNEL);
-	if (ctx->pgd == NULL) {
+	if (IS_ERR_OR_NULL(ctx->pgd)) {
 		err = -ENOMEM;
 		cry(dma_alloc_coherent, err);
 		goto err;
@@ -818,10 +821,14 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 	struct fd fd;
 	long err = 0;
 	size_t i = 0;
-	
+
+	if (cmd->size == 0) {
+		return -EINVAL;
+	}
+
 	// struct Buffer
 	buff = kzalloc(sizeof(*buff), GFP_KERNEL);
-	if (buff == NULL) {
+	if (IS_ERR_OR_NULL(buff)) {
 		err = -ENOMEM;
 		cry(kzalloc, err);
 		goto err;
@@ -829,7 +836,7 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 
 	// Page array
 	buff->pages = kzalloc(page_cnt(cmd->size) * sizeof(struct BufferPage), GFP_KERNEL);
-	if (buff->pages == NULL) {
+	if (IS_ERR_OR_NULL(buff->pages)) {
 		err = -ENOMEM;
 		cry(kzalloc, err);
 		goto err;
@@ -858,7 +865,7 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 	}
 
 	fd = fdget(buff->fd);
-	if (fd.file == NULL) {
+	if (IS_ERR_OR_NULL(fd.file)) {
 		err = -EBADF; // This should not happen, maybe BUG_ON would be better.
 		cry(fdget, err);
 		goto err;
@@ -878,6 +885,7 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 	list_add(&buff->list_node, &ctx->buffers);
 	mutex_unlock(&ctx->buffers_mutex);
 
+	BUG_ON(err);
 	return buff->fd;
 err:
 	if (buff != NULL) {
@@ -893,7 +901,7 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struc
 	struct Buffer* buff = NULL;
 	dev_addr_t dev_addr = 0;
 	uint64_t end64 = 0;
-	long err = 0;
+	long status = 0;
 	struct fd fd = {0};
 
 	if (down_interruptible(&dev->free)) {
@@ -906,44 +914,44 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struc
 	}
 
 	fd = fdget(cmd->buf_fd);
-	if (fd.file == NULL) {
-		err = -EBADF;
-		cry(err, err);
+	if (IS_ERR_OR_NULL(fd.file)) {
+		status = -EBADF;
+		cry(fdget, status);
 		goto out;
 	}
 	
 	buff = fd.file->private_data;
 	if (buff == NULL || fd.file->f_op != &buffer_api) {
+		status = -ENOENT;
 		dbg("map_buffer: fd is not a buffer\n");
-		err = -ENOENT;
 		goto err;
 	}
 
 	// Check if given buffer belongs to the ioctl's context
 	if (buff->ctx != ctx) {
+		status = -ENOENT;
 		dbg("map_buffer: buffer belongs to a different context\n");
-		err = -ENOENT;
 		goto err;
 	}
 
 	dbg("map_buffer: fd=%u writable=%u\n", cmd->buf_fd, !cmd->map_rdonly);
 	if (!ctx_find_free_area(ctx, buff->size, &dev_addr, &pred_head)) {
-		err = -ENOMEM;
-		cry(ctx_find_free_area, err);
+		status = -ENOMEM;
+		cry(ctx_find_free_area, status);
 		goto err;
 	}
 
-	dbg("map_buffer: mapping %u -> %u\n", cmd->buf_fd, dev_addr);
+	dbg("map_buffer: mapping %u -> 0x%x\n", cmd->buf_fd, dev_addr);
 	area = kzalloc(sizeof(*area), GFP_KERNEL);
-	if (area == NULL) {
-		err = -ENOMEM;
-		cry(kzalloc, err);
+	if (IS_ERR_OR_NULL(area)) {
+		status = -ENOMEM;
+		cry(kzalloc, status);
 		goto err;
 	}
 
 	end64 = (uint64_t) dev_addr + (uint64_t) buff->size;
 	if (end64 > U32_MAX) {
-		err = -ENOMEM;
+		status = -ENOMEM;
 		dbg("map_buffer: free dev addr + buff size would overflow\n");
 		goto err;
 	}
@@ -954,26 +962,29 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struc
 	area->writable = !cmd->map_rdonly;
 	INIT_LIST_HEAD(&area->list_node);
 
-	err = ctx_map_area(ctx, area);
-	if (IS_ERR_VALUE(err)) {
+	status = ctx_map_area(ctx, area);
+	if (IS_ERR_VALUE(status)) {
 		goto err;
 	}
 	get_file(fd.file); // inc refcount
+	
 	list_add(&area->list_node, pred_head);
+	
+	BUG_ON(status);
+	status = dev_addr;
 	goto out;
 
 err:
-	if (err == -ERESTARTSYS) {
-		return err;
+	if (status == -ERESTARTSYS) {
+		return status;
 	}
 	if (area != NULL) {
 		kfree(area);
 	}
 out:
-	BUG_ON(err);
 	fdput(fd);
 	up(&dev->free);
-	return err;
+	return status;
 }
 
 static long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
@@ -986,13 +997,13 @@ static long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
 	long err = 0;
 	BUG_ON(page_offset(area->beg) != 0);
 
-	dbg("map_area: area: (%x, %x) w=%u\n", area->beg, area->end, area->writable);
+	dbg("map_area: area: (0x%x, 0x%x) w=%u\n", area->beg, area->end, area->writable);
 	for (; page_idx < page_cnt(area->buffer->size); page_idx += 1) {
 		dir_idx = page_dir_index(area->beg + page_idx * PAGE_SIZE);
 		tab_idx = page_tab_index(area->beg + page_idx * PAGE_SIZE);
 
 		// make sure page table is present:
-		if (ctx->pgts[dir_idx] == NULL) {
+		if (IS_ERR_OR_NULL(ctx->pgts[dir_idx])) {
 			dbg("ctx_map_area: allocating page table [%zu]\n", dir_idx);
 			page_tab = dma_alloc_coherent(&ctx->dev->pci_dev->dev, sizeof(*page_tab), &page_tab_dma, GFP_KERNEL);
 			if (IS_ERR_OR_NULL(page_tab)) {
@@ -1063,15 +1074,11 @@ long ctx_ioctl_unmap_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, str
 		return -ERESTARTSYS;
 	}
 
-	if (ctx->broken) {
-		up(&dev->free);
-		return -EIO;
-	}
-	
 	list_for_each_entry_safe(area, tmp, &ctx->areas, list_node) {
 		if (area->beg == addr) {
 			ctx_unmap_area(ctx, area);
 			fput(area->buffer->filp);
+			dbg("removing area: buff: %d, (0x%x, 0x%x) %d\n", area->buffer->fd, area->beg, area->end, area->writable);
 			list_del(&area->list_node);
 			kfree(area);
 			goto done;
@@ -1098,6 +1105,7 @@ static void ctx_unmap_area(struct AddressSpace* ctx, struct VirtArea* area)
 		tab_idx = page_tab_index(area->beg + offset);
 
 		if (ctx->pgts[dir_idx] != NULL) {
+			dbg("unmapping dir_idx=%zu tab_idx=%zu\n", dir_idx, tab_idx);
 			ctx->pgts[dir_idx]->entry[tab_idx].value = __cpu_to_le32(0);
 		}
 	}
@@ -1110,9 +1118,11 @@ static void buffer_drop(struct Buffer *buff)
 	// Free underlying memory
 	if (buff->pages != NULL) {
 		for (i = 0; i < page_cnt(buff->size); i++) {
-			dma_free_coherent(&buff->ctx->dev->pci_dev->dev, 
-				PAGE_SIZE, buff->pages[i].hst_addr, buff->pages[i].dma_addr
-			);
+			if (buff->pages[i].hst_addr != NULL) {
+				dma_free_coherent(&buff->ctx->dev->pci_dev->dev, 
+					PAGE_SIZE, buff->pages[i].hst_addr, buff->pages[i].dma_addr
+				);
+			}
 		}
 		kfree(buff->pages);
 	}
@@ -1230,6 +1240,7 @@ int buffer_release(struct inode* inode, struct file* filp)
 
 int buffer_mmap(struct file* filp, struct vm_area_struct* vma)
 {
+	dbg("buffer_mmap: %d\n", ((struct Buffer*) filp->private_data)->fd);
 	vma->vm_ops = &buffer_vm_api;
 	return 0; 
 }
@@ -1239,7 +1250,7 @@ vm_fault_t buffer_fault(struct vm_fault *vmf)
 	struct file* filp = vmf->vma->vm_file;
 	struct Buffer* buff = filp->private_data;
 
-	dbg("buffer_fault: entry\n");
+	dbg("buffer_fault: entry (%d)\n", buff->fd);
 
 	if (vmf->pgoff >= page_cnt(buff->size)) {
 		dbg("buffer_fault: out of bounds\n");
@@ -1349,6 +1360,8 @@ void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
 	size_t written = 0;
 	BUG_ON(IS_ERR_OR_NULL(output));
 
+	dbg("DEBUG VMEM\n");
+
 	print("Buffers:\n");
 	list_for_each_entry(buff, &ctx->buffers, list_node) {
 		print("[%d] sz=(0x%x, %u)\n",
@@ -1360,7 +1373,7 @@ void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
 	print("VirtAreas: %px (prev=%px, next=%px)\n", &ctx->areas, ctx->areas.prev, ctx->areas.next);
 	list_for_each_entry(area, &ctx->areas, list_node) {
 		// dbg("area: %px\n", area);
-		print("beg=%x end=%x w=%d buff=%d\n",
+		print("beg=0x%x end=0x%x w=%d buff=%d\n",
 			area->beg, area->end, area->writable, area->buffer->fd
 		);
 	}
@@ -1369,7 +1382,7 @@ void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
 	print("Page Dir: hst=%px dma=%llx\n", ctx->pgd, ctx->pgd_dma);
 	for (i = 0; i < PAGE_ENTRIES; ++i) {
 		if (ctx->pgd->entry[i].value != 0) {
-			print("[%zu]: beg=%x hst=%px, dma=%llx\n",
+			print("[%zu]: beg=0x%x hst=%px, dma=%llx\n",
 				i, page_dir_beg(i), ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
 			);
 		}
@@ -1378,12 +1391,12 @@ void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
 
 	for (i = 0; i < PAGE_ENTRIES; ++i) {
 		if (ctx->pgd->entry[i].value != 0) {
-			print("Page Table[%zu]: beg=%x hst=%px, dma=%llx\n",
+			print("Page Table[%zu]: beg=0x%x hst=%px, dma=%llx\n",
 				i, page_dir_beg(i), ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
 			);
 			for (k = 0; k < PAGE_ENTRIES; ++k) {
 				if (page_tab_is_present(ctx->pgts[i]->entry[k])) {
-					print("[%zu] beg=%x, dma=%llx, write=%d\n",
+					print("[%zu] beg=0x%x, dma=%llx, write=%d\n",
 						k, page_tab_beg(i, k), page_tab_dma_addr(ctx->pgts[i]->entry[k]), (int) page_tab_is_writable(ctx->pgts[i]->entry[k])
 					);
 				}
