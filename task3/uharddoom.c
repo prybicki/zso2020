@@ -12,7 +12,6 @@
 #include <linux/semaphore.h>
 
 #include <linux/vmalloc.h>
-
 #include "uharddoom.h"
 #include "udoomfw.h"
 #include "udoomdev.h"
@@ -873,30 +872,32 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struc
 	struct VirtArea* area = NULL;
 	struct Buffer* buff = NULL;
 	dev_addr_t dev_addr = 0;
+	uint64_t end64 = 0;
 	long err = 0;
 	struct fd fd = {0};
-
-	// TODO ogarnij tą funkcje, tzn
 
 	lock_dev_chk_ctx();
 
 	fd = fdget(cmd->buf_fd);
-
-	// Check if given fd defines a buffer.
 	if (fd.file == NULL) {
-		fdput(fd);
-		dbg("map_buffer: bad file descriptor");
-		return -EBADF;
+		err = -EBADF;
+		cry(err, err);
+		goto out;
 	}
-	// fd.file->private_data; ???
+	
+	buff = fd.file->private_data;
+	if (buff == NULL || fd.file->f_op != &buffer_api) {
+		dbg("map_buffer: fd is not a buffer\n");
+		err = -ENOENT;
+		goto err;
+	}
 
 	// Check if given buffer belongs to the ioctl's context
 	if (buff->ctx != ctx) {
+		dbg("map_buffer: buffer belongs to a different context\n");
 		err = -ENOENT;
-		fdput(fd);
-		dbg("map_buffer: buffer from a different context");
+		goto err;
 	}
-
 
 	dbg("map_buffer: fd=%u writable=%u\n", cmd->buf_fd, !cmd->map_rdonly);
 	if (!ctx_find_free_area(ctx, buff->size, &dev_addr, &pred_head)) {
@@ -906,61 +907,65 @@ long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struc
 	}
 
 	dbg("map_buffer: mapping %u -> %u\n", cmd->buf_fd, dev_addr);
-
 	area = kzalloc(sizeof(*area), GFP_KERNEL);
 	if (area == NULL) {
 		err = -ENOMEM;
 		cry(kzalloc, err);
 		goto err;
 	}
-	// TODO: overflow!
-	// todo refcount in buffer
+
+	end64 = (uint64_t) dev_addr + (uint64_t) buff->size;
+	if (end64 > U32_MAX) {
+		err = -ENOMEM;
+		dbg("map_buffer: free dev addr + buff size would overflow\n");
+		goto err;
+	}
+	
 	area->buffer = buff;
-	INIT_LIST_HEAD(&area->list_node);
 	area->beg = dev_addr;
 	area->end = dev_addr + buff->size;
 	area->writable = !cmd->map_rdonly;
+	INIT_LIST_HEAD(&area->list_node);
 
 	err = ctx_map_area(ctx, area);
 	if (IS_ERR_VALUE(err)) {
 		goto err;
 	}
+	buff->refcount += 1;
+	
+	// TODO TLB
 
 	list_add(&area->list_node, pred_head);
+	goto out;
 
-	unlock_dev();
-	return err;
-
-	fdput(fd);
-	if (!err) {
-		return 0;
-	}
 err:
-	if (err != -ERESTARTSYS) {
-
+	if (err == -ERESTARTSYS) {
+		return err;
 	}
-	
-	
+	if (area != NULL) {
+		kfree(area);
+	}
+out:
+	fdput(fd);
 	unlock_dev();
 	return err;
 }
 
-long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
+static long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
 {
 	struct PageTab* page_tab = NULL;
 	dma_addr_t page_tab_dma = 0;
 	size_t offset = 0;
 	size_t dir_idx = 0;
 	size_t tab_idx = 0;
+	long err = 0;
 	BUG_ON(page_offset(area->beg) != 0);
 
-	dbg("ctx_map_area: area: (%u, %u) w=%u\n", area->beg, area->end, area->writable);
-	// TODO allocate page tables up front, so reversal is easier
+	dbg("map_area: area: (%x, %x) w=%u\n", area->beg, area->end, area->writable);
 	for (; offset < area->buffer->size; offset += PAGE_SIZE) {
 		dir_idx = page_dir_index(area->beg + offset);
 		tab_idx = page_tab_index(area->beg + offset);
-
-		dbg("ctx_map_area: dir_idx=%zu tab_idx=%zu\n", dir_idx, tab_idx);
+		dbg("map_area: updating dir_idx=%zu tab_idx=%zu\n", dir_idx, tab_idx);
 
 		// make sure page table is present:
 		if (ctx->pgts[dir_idx] == NULL) {
@@ -968,7 +973,8 @@ long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
 			page_tab = dma_alloc_coherent(&ctx->dev->pci_dev->dev, sizeof(*page_tab), &page_tab_dma, GFP_KERNEL);
 			if (IS_ERR_OR_NULL(page_tab)) {
 				cry(dma_alloc_coherent, -ENOMEM);
-				BUG();
+				err = -ENOMEM;
+				goto err;
 			}
 			ctx->pgts[dir_idx] = page_tab;
 			ctx->pgd->entry[dir_idx] = page_dir_make(page_tab_dma);
@@ -976,6 +982,18 @@ long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
 		ctx->pgts[dir_idx]->entry[tab_idx] = page_tab_make(area->buffer->dma_addr + offset, area->writable);
 	}
 	return 0;
+
+err:
+	// Do not deallocate PageTabs, just zero already allocated entries.
+	for (; offset < area->buffer->size; offset += PAGE_SIZE) {
+		dir_idx = page_dir_index(area->beg + offset);
+		tab_idx = page_tab_index(area->beg + offset);
+
+		if (ctx->pgts[dir_idx] != NULL) {
+			ctx->pgts[dir_idx]->entry[tab_idx].value = 0U;
+		}
+	}
+	return err;
 }
 
 bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos)
