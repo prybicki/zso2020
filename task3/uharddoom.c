@@ -9,6 +9,7 @@
 #include <linux/mman.h>
 #include <linux/file.h>
 #include <linux/bits.h>
+#include <linux/semaphore.h>
 
 #include <linux/vmalloc.h>
 
@@ -16,7 +17,6 @@
 #include "udoomfw.h"
 #include "udoomdev.h"
 
-// QUESTION Co znaczy że urządzenie obsługuje 32 bitowe wirtualne i 40 bitowe fizyczne?
 // QUESTION Czy potrzebujemy używać jakichś mem-fence podczas startu urządzenia?
 //          Np. po wgraniu firmware.
 
@@ -24,6 +24,7 @@
 // Assumptions & decisions
 /*
 - Buffer's file private data = Buffer*
+- *_drop function only deals with memory, not semantics (use release)
 
 Remove shit like (?):
 mem = alloc()
@@ -33,6 +34,9 @@ dev->mem = mem;
 TODO:
 Make sure to use consistently IS_ERR_OR_NULL;
 Last allocation part should return 
+
+TODO:
+czy anon_inode_getfd trzeba jakoś odwracac?
 
 Use __cpu_to_le32
 
@@ -46,14 +50,16 @@ _Static_assert(sizeof(dma_addr_t) == 8, "system does not support 40-bit dma addr
 // Structs
 
 struct DeviceCtx {
-	size_t index;
+	struct semaphore free;
+	struct mutex contexts_mutex;
 	struct list_head contexts; // struct AddressSpace
 
+	// These fields are written only in probe.
+	size_t index;
 	struct cdev cdev;
 	struct device* sysfs;
 	struct pci_dev* pci_dev;
 	void __iomem* iomem;
-	volatile bool busy;
 
 	bool pci_enable_device_done;
 	bool pci_request_regions_done;
@@ -81,33 +87,39 @@ struct PageTab {
 };
 
 struct AddressSpace {
-	struct DeviceCtx* device;
-	struct list_head list_node;
-	struct list_head buffers; // struct Buffer
-	struct list_head areas; // struct VirtArea
+	struct DeviceCtx* dev;
+	struct list_head list_node; // DeviceCtx.contexts
+	struct file* file;
+	bool broken;
 
+	struct mutex buffers_mutex;
+	struct list_head buffers; // struct Buffer
+
+	// VMem things should be protected by device's semaphore
+	struct list_head areas; // struct VirtArea
 	struct PageTab* pgts[PAGE_ENTRIES];
 	struct PageDir* pgd; // allocated with dma_alloc_coherent
 	dma_addr_t pgd_dma;
 };
 
+struct Buffer {
+	struct AddressSpace* ctx;
+	struct list_head list_node; // AddressSpace.buffers
+	size_t refcount; // references stored in VirtArea
+	int fd;
+
+	uint32_t size;
+	void* hst_addr;
+	dma_addr_t dma_addr;
+};
+
 struct VirtArea {
 	struct Buffer* buffer;
-	struct list_head list_node;
+	struct list_head list_node; // AddressSpace.areas
 
 	dev_addr_t beg;
 	dev_addr_t end;
 	bool writable;
-};
-
-struct Buffer {
-	struct AddressSpace* ctx;
-	struct list_head list_node;
-	
-	int fd;
-	uint32_t size;
-	void* hst_addr;
-	dma_addr_t dma_addr;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -115,46 +127,61 @@ struct Buffer {
 
 #define dbg(fmt, ...) printk(KERN_NOTICE "uharddoom@%03d: " fmt, __LINE__, ##__VA_ARGS__)
 #define cry(fn, value) dbg("%s(...) failed with %lld\n", #fn, (long long) value)
-#define W(reg, data) iowrite32(data, (void*) (((char*) device->iomem) + reg))
-#define R(reg) ioread32((void*) (((char*) device->iomem) + reg))
+#define W(reg, data) iowrite32(data, (void*) (((char*) dev->iomem) + reg))
+#define R(reg) ioread32((void*) (((char*) dev->iomem) + reg))
+
+#define lock_dev_chk_ctx() \
+	if (down_interruptible(&dev->free)) {\
+		err = -ERESTARTSYS;\
+		goto err;\
+	}\
+	if (ctx->broken) {\
+		up(&dev->free);\
+		err = -EIO;\
+		goto err;\
+	}\
+
+#define unlock_dev() \
+	up(&dev->free);
 
 int drv_initialize(void);
 void drv_terminate(void);
 
-// Main device functions
 int dev_probe(struct pci_dev *dev, const struct pci_device_id *id);
-void dev_remove (struct pci_dev *dev);
+void dev_remove(struct pci_dev *dev);
 int dev_suspend(struct pci_dev *dev, pm_message_t state);
 int dev_resume(struct pci_dev *dev);
 void dev_shutdown(struct pci_dev *dev);
-
-// Helper device functions
-struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev);
-void dev_free(struct DeviceCtx* device);
-int dev_init_pci(struct DeviceCtx* device);
-int dev_init_dma(struct DeviceCtx* device);
-int dev_init_irq(struct DeviceCtx* device);
-int dev_init_hardware(struct DeviceCtx* device);
-int dev_init_chardev(struct DeviceCtx* device);
 irqreturn_t dev_handle_irq(int irq, void* dev);
-void dev_dbg_status(struct DeviceCtx* device, uint32_t flags);
+
+static struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev);
+// static void dev_free(struct DeviceCtx* dev);
+static int dev_init_pci(struct DeviceCtx* dev);
+static int dev_init_dma(struct DeviceCtx* dev);
+static int dev_init_irq(struct DeviceCtx* dev);
+static int dev_init_hardware(struct DeviceCtx* dev);
+static int dev_init_chardev(struct DeviceCtx* dev);
+static void dev_dbg_status(struct DeviceCtx* dev, uint32_t flags);
 
 int  ctx_open(struct inode *, struct file *);
 long ctx_ioctl(struct file *, unsigned int, unsigned long);
 int  ctx_release(struct inode *, struct file *);
-long ctx_ioctl_create_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_create_buffer *cmd);
-long ctx_ioctl_map_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_map_buffer *cmd);
-long ctx_ioctl_unmap_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd);
-long ctx_ioctl_run(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd);
-long ctx_ioctl_wait(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd);
-long ctx_ioctl_debug(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
-bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos);
-long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area);
-void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
+long ctx_ioctl_create_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_create_buffer *cmd);
+long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_map_buffer *cmd);
+long ctx_ioctl_unmap_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd);
+long ctx_ioctl_run(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd);
+long ctx_ioctl_wait(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd);
+
+static void ctx_free(struct DeviceCtx *dev, struct AddressSpace *ctx);
+static long ctx_ioctl_debug(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
+static bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos);
+static long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area);
+static void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
 
 int buffer_release(struct inode *, struct file *);
 int buffer_mmap(struct file *, struct vm_area_struct *);
 vm_fault_t buffer_fault(struct vm_fault *vmf);
+void buffer_free(struct Buffer* buff);
 
 ///////////////////////////////////////////////////////////////////////////////
 // Oneliners
@@ -210,12 +237,9 @@ dma_addr_t page_tab_dma_addr(page_tab_entry_t entry) {
 }
 
 page_tab_entry_t page_tab_make(dma_addr_t dma_addr, bool writable) {
-	dbg("page_tab_make: %llx, %d\n", dma_addr, (int) writable);
-	page_tab_entry_t res = (page_tab_entry_t) {
+	return (page_tab_entry_t) {
 		.value = (dma_addr >> 8) | (writable ? 0x2 : 0) | 0x1
 	};
-	dbg("page_tab_make: %x: %llx %d\n", res.value, page_tab_dma_addr(res), (int) page_tab_is_writable(res));
-	return res;
 }
 
 size_t page_cnt(size_t bytes) {
@@ -274,7 +298,6 @@ dev_t devt_base;
 bool pci_register_driver_done;
 bool class_register_done;
 
-atomic_t deinitializing;
 DEFINE_MUTEX(devices_mutex);
 struct DeviceCtx* devices[MAX_DEVICE_COUNT];
 
@@ -343,7 +366,7 @@ void drv_terminate(void)
 ///////////////////////////////////////////////////////////////////////////////
 // Device code
 
-struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev)
+static struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev)
 {
 	struct DeviceCtx *status;
 	size_t idx;
@@ -373,6 +396,8 @@ struct DeviceCtx* dev_alloc(struct pci_dev* pci_dev)
 	devices[idx] = status;
 	devices[idx]->index = idx;
 	devices[idx]->pci_dev = pci_dev;
+	mutex_init(&devices[idx]->contexts_mutex);
+	sema_init(&devices[idx]->free, 1);
 	INIT_LIST_HEAD(&devices[idx]->contexts);
 	pci_set_drvdata(pci_dev, devices[idx]);
 out:
@@ -380,43 +405,34 @@ out:
 	return status;
 }
 
-void dev_free(struct DeviceCtx* device)
-{
-	size_t idx = device->index;
-	kfree(device);
-	mutex_lock(&devices_mutex);
-	devices[idx] = NULL;
-	mutex_unlock(&devices_mutex);
-}
-
-int dev_init_pci(struct DeviceCtx* device)
+static int dev_init_pci(struct DeviceCtx* dev)
 {
 	void* __iomem iomem = NULL;
 	int error;
 	
 
-	error = pci_enable_device(device->pci_dev);
+	error = pci_enable_device(dev->pci_dev);
 	if (error) {
 		cry(pci_enable_device, error);
 		goto out;
 	}
-	device->pci_enable_device_done = true;
+	dev->pci_enable_device_done = true;
 
-	error = pci_request_regions(device->pci_dev, DRIVER_NAME);
+	error = pci_request_regions(dev->pci_dev, DRIVER_NAME);
 	if (error) {	
 		cry(pci_request_regions, error);
 		goto out;
 	}
-	device->pci_request_regions_done = true;
+	dev->pci_request_regions_done = true;
 
 	
-	iomem = pci_iomap(device->pci_dev, 0, UHARDDOOM_BAR_SIZE);
+	iomem = pci_iomap(dev->pci_dev, 0, UHARDDOOM_BAR_SIZE);
 	if (IS_ERR_OR_NULL(iomem)) {
 		error = PTR_ERR(iomem);
 		cry(pci_iomap, error);
 		goto out;
 	}
-	device->iomem = iomem;
+	dev->iomem = iomem;
 
 	BUG_ON(error);
 	return error;
@@ -427,22 +443,22 @@ out:
 }
 
 // TODO unfinished
-int dev_init_dma(struct DeviceCtx* device)
+static int dev_init_dma(struct DeviceCtx* dev)
 {
 	int error = 0;
 
 	// TODO: co to dokładnie robi? czy trzeba to cofać?
-	pci_set_master(device->pci_dev);
-	device->pci_set_master_done = true;
+	pci_set_master(dev->pci_dev);
+	dev->pci_set_master_done = true;
 
 	// TODO czy tu jest potrzebny cleanup?
-	error = pci_set_dma_mask(device->pci_dev, UDOOMDEV_DMA_MASK);
+	error = pci_set_dma_mask(dev->pci_dev, UDOOMDEV_DMA_MASK);
 	if (error) {
 		cry(pci_set_dma_mask, error);
 		goto out;
 	}
 	
-	error = pci_set_consistent_dma_mask(device->pci_dev, UDOOMDEV_DMA_MASK);
+	error = pci_set_consistent_dma_mask(dev->pci_dev, UDOOMDEV_DMA_MASK);
 	if (error) {
 		cry(pci_set_consistent_dma_mask, error);
 		goto out;
@@ -452,7 +468,7 @@ out:
 	return error;
 }
 
-int dev_init_hardware(struct DeviceCtx* device)
+static int dev_init_hardware(struct DeviceCtx* dev)
 {
 	size_t i;
 	W(UHARDDOOM_FE_CODE_ADDR, 0);
@@ -466,151 +482,158 @@ int dev_init_hardware(struct DeviceCtx* device)
 	return 0;
 }
 
-int dev_init_chardev(struct DeviceCtx* device)
+static int dev_init_chardev(struct DeviceCtx* dev)
 {
 	struct device* parent_dev = NULL;
 	struct device* sysfs = NULL;
-	dev_t devt = devt_base + device->index;
+	dev_t devt = devt_base + dev->index;
 	int error = 0;
 
-	cdev_init(&device->cdev, &chardev_api);
-	device->cdev.owner = THIS_MODULE;
+	cdev_init(&dev->cdev, &chardev_api);
+	dev->cdev.owner = THIS_MODULE;
 
-	error = cdev_add(&device->cdev, devt, 1);
+	error = cdev_add(&dev->cdev, devt, 1);
 	if (error) {
 		cry(cdev_add, error);
 		goto out;
 	}
-	device->cdev_add_done = true;
+	dev->cdev_add_done = true;
 
-	parent_dev = &device->pci_dev->dev;
-	sysfs = device_create(&device_class, parent_dev, devt, NULL, "udoom%zd", device->index);
+	parent_dev = &dev->pci_dev->dev;
+	sysfs = device_create(&device_class, parent_dev, devt, NULL, "udoom%zd", dev->index);
 	if (IS_ERR_OR_NULL(sysfs)) {
 		error = PTR_ERR(sysfs);
 		cry(device_create, error);
 		goto out;
 	}
-	device->sysfs = sysfs;
+	dev->sysfs = sysfs;
 
 	dbg("device registered: %d %d", MAJOR(devt), MINOR(devt));
 out:
 	return error;
 }
 
-int dev_init_irq(struct DeviceCtx* device)
+static int dev_init_irq(struct DeviceCtx* dev)
 {
 	int error = 0;
 
-	error = request_irq(device->pci_dev->irq, dev_handle_irq, IRQF_SHARED, DRIVER_NAME, device);
+	error = request_irq(dev->pci_dev->irq, dev_handle_irq, IRQF_SHARED, DRIVER_NAME, dev);
 	if (error) {
 		cry(request_irq, error);
 		goto out;
 	}
-	device->request_irq_done = true;
+	dev->request_irq_done = true;
 
 out:
 	return error;
 }
 
 // TODO
-irqreturn_t dev_handle_irq(int irq, void* dev)
+irqreturn_t dev_handle_irq(int irq, void* opaque)
 {
-	struct DeviceCtx* device = (struct DeviceCtx*) dev;
+	struct DeviceCtx* dev = (struct DeviceCtx*) opaque;
+	uint32_t intr = 0;
+	uint32_t done = 0;
 	int i = 0;
 
-	uint32_t intr = R(UHARDDOOM_INTR);
-	uint32_t done = 0;
+	// Semaphore must be down here.
+	BUG_ON(down_trylock(&dev->free) == 0);
 
-	// TODO actually handle these IRQs..
+	intr = R(UHARDDOOM_INTR);
+	done = 0;
 
 	if (intr & UHARDDOOM_INTR_JOB_DONE) {
 		dbg("irq: job done\n");
-		device->busy = false;
 		done |= UHARDDOOM_INTR_JOB_DONE;
 	}
 
 	if (intr & UHARDDOOM_INTR_FE_ERROR) {
-		dbg("irg: fe error\n");
+		dbg("irq: fe error\n");
 		done |= UHARDDOOM_INTR_FE_ERROR;
 	}
 
 	if (intr & UHARDDOOM_INTR_CMD_ERROR) {
-		dbg("irg: cmd error\n");
+		dbg("irq: cmd error\n");
 		done |= UHARDDOOM_INTR_CMD_ERROR;
 	}
 
 	for (; i < 8; ++i) {
 		if (intr & UHARDDOOM_INTR_PAGE_FAULT(i)) {
-			dbg("irq: fault %d\n", i);
+			dbg("irq: page fault %d\n", i);
 			done |= UHARDDOOM_INTR_PAGE_FAULT(i);
 		}
 	}
 
 	W(UHARDDOOM_INTR, done);
+	
+	// Any interrupt implies that device is now free.
+	up(&dev->free);
 	return IRQ_HANDLED;
 }
 
 // Always called from process context, so it can sleep.
 int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 {
-	struct DeviceCtx* device = NULL;
-	int error = 0;
+	struct DeviceCtx* dev = NULL;
+	int err = 0;
+
+	dbg("device [%zd] probe beg\n", dev->index);
 	
-	dbg("device probe started\n");
-
-	device = dev_alloc(pci_dev);
-	if (IS_ERR_OR_NULL(device)) {
-		error = PTR_ERR(device);
-		goto fail;
+	// Alloc DeviceCtx, init trivial fields
+	dev = dev_alloc(pci_dev);
+	if (IS_ERR_OR_NULL(dev)) {
+		err = PTR_ERR(dev);
+		dev = NULL;
+		goto err;
 	}
 
-	dbg("initializing device [%zd]\n", device->index);
-
-	error = dev_init_pci(device);
-	if (error) {
-		goto fail;
+	err = dev_init_pci(dev);
+	if (err) {
+		goto err;
 	}
 
-	error = dev_init_dma(device);
-	if (error) {
-		goto fail;
+	err = dev_init_dma(dev);
+	if (err) {
+		goto err;
 	}
 
-	error = dev_init_hardware(device);
-	if (error) {
-		goto fail;
+	err = dev_init_hardware(dev);
+	if (err) {
+		goto err;
 	}
 
 	// Documentation/PCI/pci.rst
 	// Make sure the device is quiesced and does not have any 
 	// interrupts pending before registering the interrupt handler.
-	error = dev_init_irq(device);
-	if (error) {
-		goto fail;
+	err = dev_init_irq(dev);
+	if (err) {
+		goto err;
 	}
 
-	error = dev_init_chardev(device);
-	if (error) {
-		goto fail;
+	err = dev_init_chardev(dev);
+	if (err) {
+		goto err;
 	}
 
-	dbg("device probe done [%zd]\n", device->index);
+	dbg("device [%zd] probe end\n", dev->index);
 
-
-	dev_dbg_status(device, UDOOMDEV_DEBUG_STATUS_BASIC);
+	// dev_dbg_status(dev, UDOOMDEV_DEBUG_STATUS_BASIC);
 	return 0;
 
-fail:
-	dev_remove(pci_dev);
-	return error;
+err:
+	// TODO sure about this?
+	dbg("device [%zd] probe err = %d\n", dev->index, err);
+	if (dev != NULL) {
+		dev_remove(pci_dev);
+	}
+	return err;
 }
 
-
 // TODO unfinished, free resources
-void dev_remove(struct pci_dev *dev)
+void dev_remove(struct pci_dev *pci)
 {
-	struct DeviceCtx* device = pci_get_drvdata(dev);
-	BUG_ON(device == NULL);
+	struct DeviceCtx* dev = pci_get_drvdata(pci);
+	BUG_ON(dev == NULL);
 
 	// TODO finish tasks..
 	// Think of some locking here
@@ -619,48 +642,48 @@ void dev_remove(struct pci_dev *dev)
 
 	dbg("device removal started\n");
 
-	if (device->sysfs) {
-		device_destroy(&device_class, devt_base + device->index);
-		device->sysfs = NULL;
+	if (dev->sysfs) {
+		device_destroy(&device_class, devt_base + dev->index);
+		dev->sysfs = NULL;
 	}
 
-	if (device->cdev_add_done) {
-		cdev_del(&device->cdev);
-		device->cdev_add_done = false;
+	if (dev->cdev_add_done) {
+		cdev_del(&dev->cdev);
+		dev->cdev_add_done = false;
 	}
 
 	// DMA
-	if (device->pci_set_master_done) {
-		pci_clear_master(dev);
-		device->pci_set_master_done = false;
+	if (dev->pci_set_master_done) {
+		pci_clear_master(pci);
+		dev->pci_set_master_done = false;
 	}
 
 	// IRQ
-	if (device->request_irq_done) {
-		free_irq(dev->irq, device);
-		device->request_irq_done = false;
+	if (dev->request_irq_done) {
+		free_irq(pci->irq, dev);
+		dev->request_irq_done = false;
 	}
 
-	if (device->iomem) {
-		pci_iounmap(dev, device->iomem);
-		device->iomem = NULL;
+	if (dev->iomem) {
+		pci_iounmap(pci, dev->iomem);
+		dev->iomem = NULL;
 	}
 
-	if (device->pci_request_regions_done) {
-		pci_release_regions(dev);
-		device->pci_request_regions_done = false;
+	if (dev->pci_request_regions_done) {
+		pci_release_regions(pci);
+		dev->pci_request_regions_done = false;
 	}
 
-	if (device->pci_enable_device_done) {
-		pci_disable_device(dev);
-		device->pci_enable_device_done = false;
+	if (dev->pci_enable_device_done) {
+		pci_disable_device(pci);
+		dev->pci_enable_device_done = false;
 	}
 
 	mutex_lock(&devices_mutex);
-	devices[device->index] = NULL;
+	devices[dev->index] = NULL;
 	mutex_unlock(&devices_mutex);
-	pci_set_drvdata(device->pci_dev, NULL);
-	kfree(device);
+	pci_set_drvdata(dev->pci_dev, NULL);
+	kfree(dev);
 
 	dbg("device removal done\n");
 }
@@ -685,47 +708,88 @@ void dev_shutdown(struct pci_dev *dev)
 
 int ctx_open(struct inode *inode, struct file *file)
 {
-	struct DeviceCtx *device = container_of(inode->i_cdev, struct DeviceCtx, cdev);
+	struct DeviceCtx *dev = container_of(inode->i_cdev, struct DeviceCtx, cdev);
 	struct AddressSpace *ctx = NULL;
-	struct PageDir* pgd = NULL;
-	dma_addr_t pgd_dma = 0;
-	int status = 0;
+	int err = 0;
 
+	// struct AddressSpace
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (IS_ERR_OR_NULL(ctx)) {
-		status = -ENOMEM;
-		cry(kzalloc, status);
+	if (ctx == NULL) {
+		err = -ENOMEM;
+		cry(kzalloc, err);
 		goto err;
 	}
 
-	pgd = dma_alloc_coherent(&device->pci_dev->dev, sizeof(*pgd), &pgd_dma, GFP_KERNEL);
-	if (IS_ERR_OR_NULL(pgd)) {
-		status = -ENOMEM;
-		cry(dma_alloc_coherent, status);
+	// alloc PageDirectory
+	ctx->pgd = dma_alloc_coherent(&dev->pci_dev->dev, sizeof(*ctx->pgd), &ctx->pgd_dma, GFP_KERNEL);
+	if (ctx->pgd == NULL) {
+		err = -ENOMEM;
+		cry(dma_alloc_coherent, err);
 		goto err;
 	}
-	ctx->pgd = pgd;
-	ctx->pgd_dma = pgd_dma;
 
-	// DeviceCtx init safe part
-	// TODO increment device refcount (?)
-	ctx->device = device;
+	// Fill ctx helper fields
+	ctx->dev = dev;
+	ctx->file = file;
 	file->private_data = ctx;
+	mutex_init(&ctx->buffers_mutex);
 	INIT_LIST_HEAD(&ctx->areas);
 	INIT_LIST_HEAD(&ctx->buffers);
 	INIT_LIST_HEAD(&ctx->list_node);
-	list_add(&ctx->list_node, &device->contexts);
-	return nonseekable_open(inode, file);
 
+	// Add ctx to device's list of contexts
+	if (mutex_lock_interruptible(&dev->contexts_mutex) != 0) {
+		err = -ERESTARTSYS;
+		goto err;
+	}
+	list_add(&ctx->list_node, &dev->contexts);
+	mutex_unlock(&dev->contexts_mutex);
+
+
+	err = nonseekable_open(inode, file);
+	if (IS_ERR_VALUE((long) err)) {
+		cry(nonseekable_open, err);
+		goto err;
+	}
+	return 0;
 err:
 	if (ctx != NULL) {
-		kfree(ctx);
+		ctx_free(dev, ctx);
 	}
-	if (pgd != NULL) {
-		dma_free_coherent(&device->pci_dev->dev, sizeof(*pgd), pgd, pgd_dma);
-	}
-	BUG();
-	return status;
+	return err;
+}
+
+// TODO finish this
+static void ctx_free(struct DeviceCtx *dev, struct AddressSpace *ctx)
+{
+	// struct VirtArea *area = NULL, *tmp_area = NULL;	
+	// struct Buffer *buff = NULL, *tmp_buff = NULL;
+	// size_t i = 0;
+
+
+	// // Remove from the device's list of contexts
+	// if (!list_empty(&ctx->list_node)) {
+	// 	mutex_lock(&dev->contexts_mutex);
+	// 	list_del(&ctx->list_node);
+	// 	mutex_unlock(&dev->contexts_mutex);
+	// }
+
+	// // list_for_each_entry_safe(area, )
+
+	// // Free page tables
+	// if (ctx->pgd != NULL) {
+	// 	for (i = 0; i < PAGE_ENTRIES; ++i) {
+	// 		if (ctx->pgts[i] != NULL) {
+	// 			dma_free_coherent(&dev->pci_dev->dev, sizeof(*ctx->pgts[i]), 
+	// 				ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
+	// 			);
+	// 		}
+	// 	}
+	// 	dma_free_coherent(&dev->pci_dev->dev, sizeof(*ctx->pgd), 
+	// 				ctx->pgd, ctx->pgd_dma
+	// 	);
+	// }
+
 }
 
 int ctx_release(struct inode *inode, struct file *file)
@@ -734,101 +798,151 @@ int ctx_release(struct inode *inode, struct file *file)
 	return -EIO;
 }
 
-long ctx_ioctl_create_buffer(struct DeviceCtx* device, struct AddressSpace* ctx, struct udoomdev_ioctl_create_buffer* cmd)
+long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, struct udoomdev_ioctl_create_buffer* cmd)
 {
 	struct Buffer* buff = NULL;
-	dma_addr_t dma_addr = {0};
-	void* hst_addr = NULL;
-	long status = 0;
-	dbg("creating buffer\n");
-
+	long err = 0;
+	
+	// struct Buffer
 	buff = kzalloc(sizeof(*buff), GFP_KERNEL);
 	if (buff == NULL) {
-		status = -ENOMEM;
-		cry(kzalloc, status);
+		err = -ENOMEM;
+		cry(kzalloc, err);
 		goto err;
 	}
-	INIT_LIST_HEAD(&buff->list_node);
 	
-	// TODO handle larger allocations
-	hst_addr = dma_alloc_coherent(&device->pci_dev->dev, cmd->size, &dma_addr, GFP_KERNEL);
-	if (IS_ERR_OR_NULL(hst_addr)) {
-		status = -ENOMEM;
-		cry(dma_alloc_coherent, status);
+	// Physical memory
+	buff->hst_addr = dma_alloc_coherent(&dev->pci_dev->dev, cmd->size, &buff->dma_addr, GFP_KERNEL);
+	if (IS_ERR_OR_NULL(buff->hst_addr)) {
+		err = -ENOMEM;
+		buff->hst_addr = NULL;
+		cry(dma_alloc_coherent, err);
 		goto err;
 	}
 
-	// Create fd for buffer, copying chardev file flags.
-	status = anon_inode_getfd(THIS_MODULE->name, &buffer_api, buff, O_RDWR);
-	if (IS_ERR_VALUE(status)) {
-		cry(anon_inode_getfd, status);
+	// Get fd, set private_data
+	buff->fd = anon_inode_getfd(THIS_MODULE->name, &buffer_api, buff, O_RDWR);
+	if (IS_ERR_VALUE((long) buff->fd)) {
+		err = buff->fd;
+		buff->fd = 0;
+		cry(anon_inode_getfd, err);
 		goto err;
 	}
-
-	BUG_ON(IS_ERR_VALUE(status));
 
 	buff->ctx = ctx;
-	buff->fd = status;
-	buff->hst_addr = hst_addr;
-	buff->dma_addr = dma_addr;
 	buff->size = cmd->size;
-	list_add(&buff->list_node, &ctx->buffers);
-	dbg("buffer created: %d\n", (int) status);
-	return status;
+	INIT_LIST_HEAD(&buff->list_node);
 
-err:
-	BUG();
-	return status;
-}
-
-long ctx_ioctl_map_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_map_buffer *cmd)
-{
-	struct fd fd = fdget(cmd->buf_fd);
-	struct Buffer* buff = (fd.file == NULL) ? NULL : fd.file->private_data;
-	struct list_head* pred = NULL;
-	struct VirtArea* area = NULL;
-	dev_addr_t dev_addr = 0;
-	long status = 0;
-
-	dbg("map_buffer: fd=%u writable=%u\n", cmd->buf_fd, !cmd->map_rdonly);
-
-	if (buff == NULL) {
-		status = -EBADF;
-		dbg("ctx_ioctl_map_buffer: bad file descriptor");
+	// Add buff to context's list of buffers
+	if (mutex_lock_interruptible(&ctx->buffers_mutex) != 0) {
+		err = -ERESTARTSYS;
 		goto err;
 	}
+	list_add(&buff->list_node, &ctx->buffers);
+	mutex_unlock(&ctx->buffers_mutex);
 
-	if (!ctx_find_free_area(ctx, buff->size, &dev_addr, &pred)) {
-		status = -ENOMEM;
-		cry(ctx_find_free_area, status);
+	return err;
+err:
+	if (buff != NULL) {
+		buffer_free(buff);
+	}
+	return err;
+}
+
+void buffer_free(struct Buffer* buff) {
+	BUG_ON(buff->refcount > 0);
+
+	// Free underlying memory
+	if (buff->hst_addr) {
+		dma_free_coherent(&buff->ctx->dev->pci_dev->dev, 
+			buff->size, buff->hst_addr, buff->dma_addr
+		);
+	}
+
+	// Remove buff from context's list of buffers
+	if (!list_empty(&buff->list_node)) {
+		mutex_lock(&buff->ctx->buffers_mutex);
+		list_del(&buff->list_node);
+		mutex_unlock(&buff->ctx->buffers_mutex);
+	}
+}
+
+long ctx_ioctl_map_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_map_buffer *cmd)
+{
+	struct list_head* pred_head = NULL;
+	struct VirtArea* area = NULL;
+	struct Buffer* buff = NULL;
+	dev_addr_t dev_addr = 0;
+	long err = 0;
+	struct fd fd = {0};
+
+	// TODO ogarnij tą funkcje, tzn
+
+	lock_dev_chk_ctx();
+
+	fd = fdget(cmd->buf_fd);
+
+	// Check if given fd defines a buffer.
+	if (fd.file == NULL) {
+		fdput(fd);
+		dbg("map_buffer: bad file descriptor");
+		return -EBADF;
+	}
+	// fd.file->private_data; ???
+
+	// Check if given buffer belongs to the ioctl's context
+	if (buff->ctx != ctx) {
+		err = -ENOENT;
+		fdput(fd);
+		dbg("map_buffer: buffer from a different context");
+	}
+
+
+	dbg("map_buffer: fd=%u writable=%u\n", cmd->buf_fd, !cmd->map_rdonly);
+	if (!ctx_find_free_area(ctx, buff->size, &dev_addr, &pred_head)) {
+		err = -ENOMEM;
+		cry(ctx_find_free_area, err);
 		goto err;
 	}
 
 	dbg("map_buffer: mapping %u -> %u\n", cmd->buf_fd, dev_addr);
 
 	area = kzalloc(sizeof(*area), GFP_KERNEL);
-	if (IS_ERR_OR_NULL(area)) {
-		status = -ENOMEM;
-		cry(kzalloc, status);
+	if (area == NULL) {
+		err = -ENOMEM;
+		cry(kzalloc, err);
 		goto err;
 	}
 	// TODO: overflow!
+	// todo refcount in buffer
 	area->buffer = buff;
 	INIT_LIST_HEAD(&area->list_node);
 	area->beg = dev_addr;
 	area->end = dev_addr + buff->size;
 	area->writable = !cmd->map_rdonly;
 
-	status = ctx_map_area(ctx, area);
-	if (IS_ERR_VALUE(status)) {
+	err = ctx_map_area(ctx, area);
+	if (IS_ERR_VALUE(err)) {
 		goto err;
 	}
 
-	list_add(&area->list_node, pred);
-	return status;
+	list_add(&area->list_node, pred_head);
+
+	unlock_dev();
+	return err;
+
+	fdput(fd);
+	if (!err) {
+		return 0;
+	}
 err:
-	BUG();
-	return status;
+	if (err != -ERESTARTSYS) {
+
+	}
+	
+	
+	unlock_dev();
+	return err;
 }
 
 long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
@@ -851,7 +965,7 @@ long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area)
 		// make sure page table is present:
 		if (ctx->pgts[dir_idx] == NULL) {
 			dbg("ctx_map_area: allocating page table [%zu]\n", dir_idx);
-			page_tab = dma_alloc_coherent(&ctx->device->pci_dev->dev, sizeof(*page_tab), &page_tab_dma, GFP_KERNEL);
+			page_tab = dma_alloc_coherent(&ctx->dev->pci_dev->dev, sizeof(*page_tab), &page_tab_dma, GFP_KERNEL);
 			if (IS_ERR_OR_NULL(page_tab)) {
 				cry(dma_alloc_coherent, -ENOMEM);
 				BUG();
@@ -901,112 +1015,53 @@ bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, 
 	return false;
 }
 
-
-long ctx_ioctl_unmap_buffer(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd)
+long ctx_ioctl_unmap_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_unmap_buffer *cmd)
 {
 	return -EIO;
 }
 
-long ctx_ioctl_run(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd)
+long ctx_ioctl_run(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd)
 {
-	// generalnie to tutaj będzie niezła zabawa z ogarnięciem synchronizacji tutaj
+	long err = 0;
 
-	// wait until device is free
 	if (cmd->addr % 4 != 0 || cmd->size % 4 != 0) {
-		return -EINVAL;
+		err = -EINVAL;
+		goto err;
 	}
 
-	while (device->busy)
-		;
-	
-	device->busy = true;
+	lock_dev_chk_ctx();
+
 	W(UHARDDOOM_JOB_PDP, (ctx->pgd_dma >> 12));
 	W(UHARDDOOM_JOB_CMD_PTR, cmd->addr);
 	W(UHARDDOOM_JOB_CMD_SIZE, cmd->size);
 	W(UHARDDOOM_JOB_TRIGGER, 1);
 
+	// up(&dev->free) is done in irq handler.
 	return 0;
+err:
+	return err;
 }
 
-long ctx_ioctl_wait(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd)
+long ctx_ioctl_wait(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd)
 {
-	while (device->busy)
-		;
+	long err = 0;
+
+	// Since ioctl_run is synchronous, there can be max 1 pending task
+	if (cmd->num_back >= 1) {
+		return 0;
+	}
+
+	lock_dev_chk_ctx();
+	unlock_dev();
 	return 0;
+err:
+	return err;
 }
-
-long ctx_ioctl_debug(struct DeviceCtx *device, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
-{
-	if (cmd->flags & UDOOMDEV_DEBUG_VMEM) {
-		ctx_dbg_vmem(ctx, cmd);
-	}
-	dev_dbg_status(device, cmd->flags);
-	return 0;
-}
-
-#define print(fmt, ...) written += snprintf(output + written, UDOOMDEV_DEBUG_BUFFER_SIZE - written, fmt, ##__VA_ARGS__)
-void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
-{
-	char *output = vzalloc(UDOOMDEV_DEBUG_BUFFER_SIZE);
-	struct VirtArea* area = NULL;
-	struct Buffer* buff = NULL;
-	size_t i = 0, k = 0;
-	size_t written = 0;
-	BUG_ON(IS_ERR_OR_NULL(output));
-
-	print("Buffers:\n");
-	list_for_each_entry(buff, &ctx->buffers, list_node) {
-		print("[%d] sz=(0x%x, %u) hst=%px dma=%llx\n",
-			buff->fd, buff->size, buff->size, buff->hst_addr, buff->dma_addr
-		);
-	}
-	print("\n");
-
-	print("VirtAreas: %px (prev=%px, next=%px)\n", &ctx->areas, ctx->areas.prev, ctx->areas.next);
-	list_for_each_entry(area, &ctx->areas, list_node) {
-		// dbg("area: %px\n", area);
-		print("beg=%x end=%x w=%d buff=%d\n",
-			area->beg, area->end, area->writable, area->buffer->fd
-		);
-	}
-	print("\n");
-
-	print("Page Dir: hst=%px dma=%llx\n", ctx->pgd, ctx->pgd_dma);
-	for (i = 0; i < PAGE_ENTRIES; ++i) {
-		if (ctx->pgd->entry[i].value != 0) {
-			print("[%zu]: beg=%x hst=%px, dma=%llx\n",
-				i, page_dir_beg(i), ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
-			);
-		}
-	}
-	print("\n");
-
-	for (i = 0; i < PAGE_ENTRIES; ++i) {
-		if (ctx->pgd->entry[i].value != 0) {
-			print("Page Table[%zu]: beg=%x hst=%px, dma=%llx\n",
-				i, page_dir_beg(i), ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
-			);
-			for (k = 0; k < PAGE_ENTRIES; ++k) {
-				if (page_tab_is_present(ctx->pgts[i]->entry[k])) {
-					print("[%zu] beg=%x, dma=%llx, write=%d\n",
-						k, page_tab_beg(i, k), page_tab_dma_addr(ctx->pgts[i]->entry[k]), (int) page_tab_is_writable(ctx->pgts[i]->entry[k])
-					);
-				}
-			}
-			print("\n");
-		}
-	}
-	print("\n");
-
-	BUG_ON(copy_to_user(cmd->output, output, written));
-	vfree(output);
-}
-#undef print
 
 long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 {
 	struct AddressSpace *ctx = file->private_data;
-	struct DeviceCtx *device = ctx->device;
+	struct DeviceCtx *dev = ctx->dev;
 	union {
 		struct udoomdev_ioctl_create_buffer create;
 		struct udoomdev_ioctl_map_buffer map;
@@ -1016,36 +1071,35 @@ long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 		struct udoomdev_ioctl_debug debug;
 	} data;
 
-	// TODO make it compile
-	int status = 0;
+	int err = 0;
 	switch (cmd) {
-		case UDOOMDEV_IOCTL_CREATE_BUFFER: status = copy_from_user(&data.create, (void*) args, sizeof(data.create)); break;
-		case UDOOMDEV_IOCTL_MAP_BUFFER:    status = copy_from_user(&data.map,    (void*) args, sizeof(data.map)); break;
-		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  status = copy_from_user(&data.unmap,  (void*) args, sizeof(data.unmap)); break;
-		case UDOOMDEV_IOCTL_RUN:           status = copy_from_user(&data.run,    (void*) args, sizeof(data.run)); break;
-		case UDOOMDEV_IOCTL_WAIT:          status = copy_from_user(&data.wait,   (void*) args, sizeof(data.wait)); break;
-		case UDOOMDEV_IOCTL_DEBUG:         status = copy_from_user(&data.debug,  (void*) args, sizeof(data.debug)); break;
+		case UDOOMDEV_IOCTL_CREATE_BUFFER: err = copy_from_user(&data.create, (void*) args, sizeof(data.create)); break;
+		case UDOOMDEV_IOCTL_MAP_BUFFER:    err = copy_from_user(&data.map,    (void*) args, sizeof(data.map)); break;
+		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  err = copy_from_user(&data.unmap,  (void*) args, sizeof(data.unmap)); break;
+		case UDOOMDEV_IOCTL_RUN:           err = copy_from_user(&data.run,    (void*) args, sizeof(data.run)); break;
+		case UDOOMDEV_IOCTL_WAIT:          err = copy_from_user(&data.wait,   (void*) args, sizeof(data.wait)); break;
+		case UDOOMDEV_IOCTL_DEBUG:         err = copy_from_user(&data.debug,  (void*) args, sizeof(data.debug)); break;
 	}
 
-	if (status > 0) {
-		dbg("ctx_ioctl: fault");
+	if (err > 0) {
+		dbg("ctx_ioctl: invalid user");
 		return -EFAULT;
 	}
 
 	switch (cmd) {
-		case UDOOMDEV_IOCTL_CREATE_BUFFER: return ctx_ioctl_create_buffer(device, ctx, &data.create);
-		case UDOOMDEV_IOCTL_MAP_BUFFER:    return ctx_ioctl_map_buffer(device, ctx, &data.map);
-		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  return ctx_ioctl_unmap_buffer(device, ctx, &data.unmap);
-		case UDOOMDEV_IOCTL_RUN:           return ctx_ioctl_run(device, ctx, &data.run);
-		case UDOOMDEV_IOCTL_WAIT:          return ctx_ioctl_wait(device, ctx, &data.wait);
-		case UDOOMDEV_IOCTL_DEBUG:         return ctx_ioctl_debug(device, ctx, &data.debug);
+		case UDOOMDEV_IOCTL_CREATE_BUFFER: return ctx_ioctl_create_buffer(dev, ctx, &data.create);
+		case UDOOMDEV_IOCTL_MAP_BUFFER:    return ctx_ioctl_map_buffer(dev, ctx, &data.map);
+		case UDOOMDEV_IOCTL_UNMAP_BUFFER:  return ctx_ioctl_unmap_buffer(dev, ctx, &data.unmap);
+		case UDOOMDEV_IOCTL_RUN:           return ctx_ioctl_run(dev, ctx, &data.run);
+		case UDOOMDEV_IOCTL_WAIT:          return ctx_ioctl_wait(dev, ctx, &data.wait);
+		case UDOOMDEV_IOCTL_DEBUG:         return ctx_ioctl_debug(dev, ctx, &data.debug);
 	}
 
 	return -ENOTTY;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Buffer interface
+// Buffer API
 
 int buffer_release(struct inode* inode, struct file* filp)
 {
@@ -1084,7 +1138,7 @@ module_exit(drv_terminate);
 ///////////////////////////////////////////////////////////////////////////////
 // Debug
 
-void dev_dbg_status(struct DeviceCtx* device, unsigned flags)
+void dev_dbg_status(struct DeviceCtx* dev, unsigned flags)
 {
 	static uint32_t stats[UHARDDOOM_STATS_NUM];
 	uint32_t status;
@@ -1152,3 +1206,71 @@ void dev_dbg_status(struct DeviceCtx* device, unsigned flags)
 	}
 
 }
+
+long ctx_ioctl_debug(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
+{
+	if (cmd->flags & UDOOMDEV_DEBUG_VMEM) {
+		ctx_dbg_vmem(ctx, cmd);
+	}
+	dev_dbg_status(dev, cmd->flags);
+	return 0;
+}
+
+#define print(fmt, ...) written += snprintf(output + written, UDOOMDEV_DEBUG_BUFFER_SIZE - written, fmt, ##__VA_ARGS__)
+void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd)
+{
+	char *output = vzalloc(UDOOMDEV_DEBUG_BUFFER_SIZE);
+	struct VirtArea* area = NULL;
+	struct Buffer* buff = NULL;
+	size_t i = 0, k = 0;
+	size_t written = 0;
+	BUG_ON(IS_ERR_OR_NULL(output));
+
+	print("Buffers:\n");
+	list_for_each_entry(buff, &ctx->buffers, list_node) {
+		print("[%d] sz=(0x%x, %u) hst=%px dma=%llx\n",
+			buff->fd, buff->size, buff->size, buff->hst_addr, buff->dma_addr
+		);
+	}
+	print("\n");
+
+	print("VirtAreas: %px (prev=%px, next=%px)\n", &ctx->areas, ctx->areas.prev, ctx->areas.next);
+	list_for_each_entry(area, &ctx->areas, list_node) {
+		// dbg("area: %px\n", area);
+		print("beg=%x end=%x w=%d buff=%d\n",
+			area->beg, area->end, area->writable, area->buffer->fd
+		);
+	}
+	print("\n");
+
+	print("Page Dir: hst=%px dma=%llx\n", ctx->pgd, ctx->pgd_dma);
+	for (i = 0; i < PAGE_ENTRIES; ++i) {
+		if (ctx->pgd->entry[i].value != 0) {
+			print("[%zu]: beg=%x hst=%px, dma=%llx\n",
+				i, page_dir_beg(i), ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
+			);
+		}
+	}
+	print("\n");
+
+	for (i = 0; i < PAGE_ENTRIES; ++i) {
+		if (ctx->pgd->entry[i].value != 0) {
+			print("Page Table[%zu]: beg=%x hst=%px, dma=%llx\n",
+				i, page_dir_beg(i), ctx->pgts[i], page_dir_tab_addr(ctx->pgd->entry[i])
+			);
+			for (k = 0; k < PAGE_ENTRIES; ++k) {
+				if (page_tab_is_present(ctx->pgts[i]->entry[k])) {
+					print("[%zu] beg=%x, dma=%llx, write=%d\n",
+						k, page_tab_beg(i, k), page_tab_dma_addr(ctx->pgts[i]->entry[k]), (int) page_tab_is_writable(ctx->pgts[i]->entry[k])
+					);
+				}
+			}
+			print("\n");
+		}
+	}
+	print("\n");
+
+	BUG_ON(copy_to_user(cmd->output, output, written));
+	vfree(output);
+}
+#undef print
