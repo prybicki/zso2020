@@ -20,22 +20,6 @@
 // Assumptions & decisions
 /*
 - Buffer's file private data = Buffer*
-- *_free function only deals with memory, not semantics (use release)
-
-Remove shit like (?):
-mem = alloc()
-if () ...
-dev->mem = mem;
-
-TODO:
-Make sure to use consistently IS_ERR_OR_NULL;
-Last allocation part should return 
-
-TODO:
-czy anon_inode_getfd trzeba jakoś odwracac?
-
-Use __cpu_to_le32
-
 */
 
 _Static_assert(sizeof(dma_addr_t) == 8, "system does not support 40-bit dma addresses");
@@ -159,24 +143,20 @@ long ctx_ioctl_unmap_buffer(struct DeviceCtx *dev, struct AddressSpace *ctx, str
 long ctx_ioctl_run(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_run *cmd);
 long ctx_ioctl_wait(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_wait *cmd);
 
-static void ctx_free(struct DeviceCtx *dev, struct AddressSpace *ctx);
 static long ctx_ioctl_debug(struct DeviceCtx *dev, struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
 static bool ctx_find_free_area(struct AddressSpace* ctx, size_t size, dev_addr_t* out, struct list_head **pos);
 static long ctx_map_area(struct AddressSpace* ctx, struct VirtArea* area);
 static void ctx_unmap_area(struct AddressSpace* ctx, struct VirtArea* area);
 static void ctx_dbg_vmem(struct AddressSpace *ctx, struct udoomdev_ioctl_debug *cmd);
+static void ctx_drop(struct DeviceCtx* dev, struct AddressSpace* ctx);
 
 int buffer_release(struct inode *, struct file *);
 int buffer_mmap(struct file *, struct vm_area_struct *);
 vm_fault_t buffer_fault(struct vm_fault *vmf);
-static void buffer_drop(struct Buffer *buff);
+static void buffer_drop(struct Buffer *buff, bool);
 
 ///////////////////////////////////////////////////////////////////////////////
 // Oneliners
-
-// TODO use it:
-// BUG_ON((page_tab_addr & PAGE_MASK) != 0) // must be aligned to page size
-// BUG_ON((page_tab_addr & (~UDOOMDEV_DMA_MASK)) != 0) // must fit into DMA bits
 
 dev_addr_t page_dir_beg(size_t dir_idx) {
 	return dir_idx << 22;
@@ -327,10 +307,16 @@ failed:
 	return error;
 }
 
-// TODO
 void drv_terminate(void)
 {
+	size_t i = 0;
 	dbg("driver termination started\n");
+
+	for (i = 0; i < MAX_DEVICE_COUNT; i++) {
+		if (devices[i] != NULL) {
+			dev_remove(devices[i]->pci_dev); // lock inside
+		}
+	}
 
 	if (pci_register_driver_done) {
 		pci_unregister_driver(&driver_api);
@@ -425,20 +411,16 @@ static int dev_init_pci(struct DeviceCtx* dev)
 	return error;
 
 out:
-	// TODO cleanup?
 	return error;
 }
 
-// TODO unfinished
 static int dev_init_dma(struct DeviceCtx* dev)
 {
 	int error = 0;
 
-	// TODO: co to dokładnie robi? czy trzeba to cofać?
 	pci_set_master(dev->pci_dev);
 	dev->pci_set_master_done = true;
 
-	// TODO czy tu jest potrzebny cleanup?
 	error = pci_set_dma_mask(dev->pci_dev, UDOOMDEV_DMA_MASK);
 	if (error) {
 		cry(pci_set_dma_mask, error);
@@ -530,7 +512,6 @@ struct AddressSpace* dev_get_ctx(struct DeviceCtx* dev)
 	BUG();
 }
 
-// TODO
 irqreturn_t dev_handle_irq(int irq, void* opaque)
 {
 	struct DeviceCtx* dev = (struct DeviceCtx*) opaque;
@@ -635,7 +616,6 @@ int dev_probe(struct pci_dev* pci_dev, const struct pci_device_id *id)
 	return 0;
 
 err:
-	// TODO sure about this?
 	dbg("device [%zd] probe err = %d\n", dev->index, err);
 	if (dev != NULL) {
 		dev_remove(pci_dev);
@@ -643,18 +623,20 @@ err:
 	return err;
 }
 
-// TODO unfinished, free resources
 void dev_remove(struct pci_dev *pci)
 {
 	struct DeviceCtx* dev = pci_get_drvdata(pci);
-	BUG_ON(IS_ERR_OR_NULL(dev));
+	struct AddressSpace* ctx = NULL, *tmp_ctx = NULL;
 
-	// TODO finish tasks..
-	// Think of some locking here
-	// TODO ORDERING MAY BE WRONG!!!
-	// Especially IRQ/DMA
+	if (dev == NULL) {
+		return;
+	}
 
 	dbg("device removal started\n");
+
+	list_for_each_entry_safe(ctx, tmp_ctx, &dev->contexts, list_node) {
+		ctx_drop(dev, ctx); // locks and removes from dev.contexts
+	}
 
 	if (dev->sysfs) {
 		device_destroy(&device_class, devt_base + dev->index);
@@ -697,24 +679,35 @@ void dev_remove(struct pci_dev *pci)
 	devices[dev->index] = NULL;
 	mutex_unlock(&devices_mutex);
 	pci_set_drvdata(dev->pci_dev, NULL);
+
 	kfree(dev);
 
 	dbg("device removal done\n");
 }
 
-int dev_suspend(struct pci_dev *dev, pm_message_t state)
+int dev_suspend(struct pci_dev *pci, pm_message_t state)
 {
-	return -EIO;
+	struct DeviceCtx* dev = pci_get_drvdata(pci);
+
+	// wait until job is done
+	down(&dev->free);
+	up(&dev->free);
+	return 0;;
 }
 
-int dev_resume(struct pci_dev *dev)
+int dev_resume(struct pci_dev *pci)
 {
-	return -EIO;
+	struct DeviceCtx* dev = pci_get_drvdata(pci);
+	dev_init_hardware(dev, true);
+	return 0;
 }
 
-void dev_shutdown(struct pci_dev *dev)
+void dev_shutdown(struct pci_dev *pci)
 {
-
+	struct DeviceCtx* dev = pci_get_drvdata(pci);
+	// wait until job is done
+	down(&dev->free);
+	up(&dev->free);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -733,6 +726,13 @@ int ctx_open(struct inode *inode, struct file *file)
 		cry(kzalloc, err);
 		goto err;
 	}
+	ctx->dev = dev;
+	ctx->file = file;
+	file->private_data = ctx;
+	mutex_init(&ctx->buffers_mutex);
+	INIT_LIST_HEAD(&ctx->areas);
+	INIT_LIST_HEAD(&ctx->buffers);
+	INIT_LIST_HEAD(&ctx->list_node);
 
 	// alloc PageDirectory
 	ctx->pgd = dma_alloc_coherent(&dev->pci_dev->dev, sizeof(*ctx->pgd), &ctx->pgd_dma, GFP_KERNEL);
@@ -741,15 +741,6 @@ int ctx_open(struct inode *inode, struct file *file)
 		cry(dma_alloc_coherent, err);
 		goto err;
 	}
-
-	// Fill ctx helper fields
-	ctx->dev = dev;
-	ctx->file = file;
-	file->private_data = ctx;
-	mutex_init(&ctx->buffers_mutex);
-	INIT_LIST_HEAD(&ctx->areas);
-	INIT_LIST_HEAD(&ctx->buffers);
-	INIT_LIST_HEAD(&ctx->list_node);
 
 	// Add ctx to device's list of contexts
 	if (mutex_lock_interruptible(&dev->contexts_mutex) != 0) {
@@ -768,46 +759,38 @@ int ctx_open(struct inode *inode, struct file *file)
 	return 0;
 err:
 	if (ctx != NULL) {
-		ctx_free(dev, ctx);
+		ctx_drop(dev, ctx);
 	}
 	return err;
 }
 
-size_t list_size(struct list_head* head)
-{
-	struct list_head* pos = NULL;
-	size_t cnt = 0;
-	list_for_each(pos, head) {
-		cnt +=1 ;
-	}
-	return cnt;
-}
 
 int ctx_release(struct inode *inode, struct file *file)
 {
 	struct AddressSpace* ctx = file->private_data;
 	struct DeviceCtx* dev = ctx->dev;
+	ctx_drop(dev, ctx);
+	return 0;
+}
+
+static void ctx_drop(struct DeviceCtx* dev, struct AddressSpace* ctx)
+{
 	struct VirtArea* area = NULL, *tmp_area = NULL;
 	struct Buffer* buff = 0, *tmp_buff = NULL;
 	size_t i = 0;
 
-	dbg("ctx_release: entry\n");
+	dbg("ctx_drop: entry\n");
 
 	// guarantees that device is not using mappings we're about to free
 	down(&ctx->dev->free);
 
 	list_for_each_entry_safe(area, tmp_area, &ctx->areas, list_node) {
-		fput(area->buffer->filp); // AFAIU this will trigger buffer_release
 		list_del(&area->list_node);
 		kfree(area);
 	}
 
-	// There should be not buffers at this point
-	// because ctx->file refcount must be zero at this point
-	// and every buffer increments it by 1.
 	list_for_each_entry_safe(buff, tmp_buff, &ctx->buffers, list_node) {
-		printk(KERN_WARNING "ctx_release: WARNING: releasing orphaned buffer! (?)\n");
-		buffer_drop(buff); // locks and removes it from ctx.buffers
+		buffer_drop(buff, false); // locks and removes it from ctx.buffers
 	}
 
 	// Free page tables
@@ -833,8 +816,7 @@ int ctx_release(struct inode *inode, struct file *file)
 	up(&ctx->dev->free);
 	kfree(ctx);
 
-	dbg("ctx_release: done\n");
-	return 0;
+	dbg("ctx_drop: done\n");
 }
 
 long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, struct udoomdev_ioctl_create_buffer* cmd)
@@ -913,7 +895,7 @@ long ctx_ioctl_create_buffer(struct DeviceCtx* dev, struct AddressSpace* ctx, st
 	return buff->fd;
 err:
 	if (buff != NULL) {
-		buffer_drop(buff);
+		buffer_drop(buff, true);
 	}
 	return err;
 }
@@ -1135,7 +1117,7 @@ static void ctx_unmap_area(struct AddressSpace* ctx, struct VirtArea* area)
 	}
 }
 
-static void buffer_drop(struct Buffer *buff)
+static void buffer_drop(struct Buffer *buff, bool dec_refcount)
 {
 	size_t i = 0;
 	dbg("buffer_drop: entry\n");
@@ -1157,7 +1139,9 @@ static void buffer_drop(struct Buffer *buff)
 		list_del(&buff->list_node);
 		mutex_unlock(&buff->ctx->buffers_mutex);
 	}
-	fput(buff->ctx->file); // dec refcount
+	if (dec_refcount) {
+		fput(buff->ctx->file); // dec refcount
+	}
 	kfree(buff);
 	dbg("buffer_drop: done\n");
 
@@ -1259,7 +1243,7 @@ long ctx_ioctl(struct file *file, unsigned int cmd, unsigned long args)
 int buffer_release(struct inode* inode, struct file* filp)
 {
 	struct Buffer *buff = filp->private_data;
-	buffer_drop(buff);
+	buffer_drop(buff, true);
 	return 0;
 }
 
@@ -1365,6 +1349,17 @@ void dev_dbg_status(struct DeviceCtx* dev, unsigned flags)
 	}
 
 }
+
+size_t list_size(struct list_head* head)
+{
+	struct list_head* pos = NULL;
+	size_t cnt = 0;
+	list_for_each(pos, head) {
+		cnt +=1 ;
+	}
+	return cnt;
+}
+
 
 static void _ctx_dbg(struct DeviceCtx* dev, struct AddressSpace* ctx)
 {
